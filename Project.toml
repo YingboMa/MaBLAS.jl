@@ -1,0 +1,19 @@
+name = "SmallLinearAlgbra"
+uuid = "42749426-4a14-4e48-b862-652cce965524"
+authors = ["Yingbo Ma <mayingbo5@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
+
+[compat]
+SIMD = "2.8"
+julia = "1.0"
+
+[extras]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SafeTestsets = "1bc83da4-3b8d-516f-aca4-4fe02f6d838f"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["SafeTestsets", "Test"]
