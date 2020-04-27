@@ -18,8 +18,6 @@ using LinearAlgebra: Transpose, Adjoint
 
 function mul!(C, A, B, α=true, β=false)
     # assume Float64 for now
-    α = convert(eltype(C), α)
-    β = convert(eltype(A), β)
     cache_params = (cache_m=72, cache_k=256, cache_n=4080)
     kernel_params = (Val(8), Val(6))
     return tiling_mul!(C, A, B, α, β, cache_params, kernel_params)
@@ -47,7 +45,7 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
                 for microjstart in cachejstart:micro_n:cachejend, microistart in cacheistart:micro_m:cacheiend
                     # (micro_m × micro_n) = (micro_m × ks) * (ks × micro_n)
                     # C[i:(i+micro_m-1)] = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                    tiling_microkernel!(C, A, B, microistart, microjstart, cachepstart, cachepend, kernel_params)
+                    tiling_microkernel!(C, A, B, α, β, microistart, microjstart, cachepstart, cachepend, kernel_params)
                 end
             end # cachei
         end # cachep
@@ -71,7 +69,7 @@ end
 ### Micro kernel
 ###
 
-@noinline function tiling_microkernel!(C::SIMD.FastContiguousArray{Float64}, A::SIMD.FastContiguousArray{Float64}, B::SIMD.FastContiguousArray{Float64},
+@noinline function tiling_microkernel!(C::SIMD.FastContiguousArray{Float64}, A::SIMD.FastContiguousArray{Float64}, B::SIMD.FastContiguousArray{Float64}, α, β,
                                      i, j, pstart, pend, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     T = Float64
     N = 4
@@ -89,23 +87,32 @@ end
     #        vecload(V, C, ptrĈ, i, j)
     #    end
     #end::NTuple{mn,ĈT}
+    #=
     Ĉ11 = vecload(V, C, ptrĈ, 1, 1)
     Ĉ21 = vecload(V, C, ptrĈ, 2, 1)
-
     Ĉ12 = vecload(V, C, ptrĈ, 1, 2)
     Ĉ22 = vecload(V, C, ptrĈ, 2, 2)
-
     Ĉ13 = vecload(V, C, ptrĈ, 1, 3)
     Ĉ23 = vecload(V, C, ptrĈ, 2, 3)
-
     Ĉ14 = vecload(V, C, ptrĈ, 1, 4)
     Ĉ24 = vecload(V, C, ptrĈ, 2, 4)
-
     Ĉ15 = vecload(V, C, ptrĈ, 1, 5)
     Ĉ25 = vecload(V, C, ptrĈ, 2, 5)
-
     Ĉ16 = vecload(V, C, ptrĈ, 1, 6)
     Ĉ26 = vecload(V, C, ptrĈ, 2, 6)
+    =#
+    Ĉ11 = zero(V)
+    Ĉ21 = zero(V)
+    Ĉ12 = zero(V)
+    Ĉ22 = zero(V)
+    Ĉ13 = zero(V)
+    Ĉ23 = zero(V)
+    Ĉ14 = zero(V)
+    Ĉ24 = zero(V)
+    Ĉ15 = zero(V)
+    Ĉ25 = zero(V)
+    Ĉ16 = zero(V)
+    Ĉ26 = zero(V)
 
     p = pstart
     for _ in 1:punroll
@@ -382,23 +389,45 @@ end
         p += 1
     end
 
-    vecstore(Ĉ11, C, ptrĈ, 1, 1)
-    vecstore(Ĉ21, C, ptrĈ, 2, 1)
-
-    vecstore(Ĉ12, C, ptrĈ, 1, 2)
-    vecstore(Ĉ22, C, ptrĈ, 2, 2)
-
-    vecstore(Ĉ13, C, ptrĈ, 1, 3)
-    vecstore(Ĉ23, C, ptrĈ, 2, 3)
-
-    vecstore(Ĉ14, C, ptrĈ, 1, 4)
-    vecstore(Ĉ24, C, ptrĈ, 2, 4)
-
-    vecstore(Ĉ15, C, ptrĈ, 1, 5)
-    vecstore(Ĉ25, C, ptrĈ, 2, 5)
-
-    vecstore(Ĉ16, C, ptrĈ, 1, 6)
-    vecstore(Ĉ26, C, ptrĈ, 2, 6)
+    if β === false
+        vecstore(α * Ĉ11, C, ptrĈ, 1, 1)
+        vecstore(α * Ĉ21, C, ptrĈ, 2, 1)
+        vecstore(α * Ĉ12, C, ptrĈ, 1, 2)
+        vecstore(α * Ĉ22, C, ptrĈ, 2, 2)
+        vecstore(α * Ĉ13, C, ptrĈ, 1, 3)
+        vecstore(α * Ĉ23, C, ptrĈ, 2, 3)
+        vecstore(α * Ĉ14, C, ptrĈ, 1, 4)
+        vecstore(α * Ĉ24, C, ptrĈ, 2, 4)
+        vecstore(α * Ĉ15, C, ptrĈ, 1, 5)
+        vecstore(α * Ĉ25, C, ptrĈ, 2, 5)
+        vecstore(α * Ĉ16, C, ptrĈ, 1, 6)
+        vecstore(α * Ĉ26, C, ptrĈ, 2, 6)
+    else
+        Ĉ11 = fma(α, Ĉ11, β * vecload(V, C, ptrĈ, 1, 1))
+        Ĉ21 = fma(α, Ĉ21, β * vecload(V, C, ptrĈ, 2, 1))
+        Ĉ12 = fma(α, Ĉ12, β * vecload(V, C, ptrĈ, 1, 2))
+        Ĉ22 = fma(α, Ĉ22, β * vecload(V, C, ptrĈ, 2, 2))
+        Ĉ13 = fma(α, Ĉ13, β * vecload(V, C, ptrĈ, 1, 3))
+        Ĉ23 = fma(α, Ĉ23, β * vecload(V, C, ptrĈ, 2, 3))
+        Ĉ14 = fma(α, Ĉ14, β * vecload(V, C, ptrĈ, 1, 4))
+        Ĉ24 = fma(α, Ĉ24, β * vecload(V, C, ptrĈ, 2, 4))
+        Ĉ15 = fma(α, Ĉ15, β * vecload(V, C, ptrĈ, 1, 5))
+        Ĉ25 = fma(α, Ĉ25, β * vecload(V, C, ptrĈ, 2, 5))
+        Ĉ16 = fma(α, Ĉ16, β * vecload(V, C, ptrĈ, 1, 6))
+        Ĉ26 = fma(α, Ĉ26, β * vecload(V, C, ptrĈ, 2, 6))
+        vecstore(Ĉ11, C, ptrĈ, 1, 1)
+        vecstore(Ĉ21, C, ptrĈ, 2, 1)
+        vecstore(Ĉ12, C, ptrĈ, 1, 2)
+        vecstore(Ĉ22, C, ptrĈ, 2, 2)
+        vecstore(Ĉ13, C, ptrĈ, 1, 3)
+        vecstore(Ĉ23, C, ptrĈ, 2, 3)
+        vecstore(Ĉ14, C, ptrĈ, 1, 4)
+        vecstore(Ĉ24, C, ptrĈ, 2, 4)
+        vecstore(Ĉ15, C, ptrĈ, 1, 5)
+        vecstore(Ĉ25, C, ptrĈ, 2, 5)
+        vecstore(Ĉ16, C, ptrĈ, 1, 6)
+        vecstore(Ĉ26, C, ptrĈ, 2, 6)
+    end
 
     return nothing
 end
