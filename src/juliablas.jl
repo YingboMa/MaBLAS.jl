@@ -17,6 +17,20 @@ using LinearAlgebra: Transpose, Adjoint
 ###
 
 function mul!(C, A, B, α=true, β=false)
+    iszeroα = iszero(α)
+    if iszero(β) && iszeroα
+        return fill!(C, zero(eltype(C)))
+    elseif isone(β) && iszeroα
+        return C
+    elseif iszeroα
+        # TODO: optimize this
+        for ii in eachindex(C)
+            Cii = @inbounds C[ii]
+            Cii = β * Cii
+            @inbounds C[ii] = Cii
+        end
+        return C
+    end
     # assume Float64 for now
     cache_params = (cache_m=72, cache_k=256, cache_n=4080)
     kernel_params = (Val(8), Val(6))
@@ -403,30 +417,18 @@ end
         vecstore(α * Ĉ16, C, ptrĈ, 1, 6)
         vecstore(α * Ĉ26, C, ptrĈ, 2, 6)
     else
-        Ĉ11 = fma(α, Ĉ11, β * vecload(V, C, ptrĈ, 1, 1))
-        Ĉ21 = fma(α, Ĉ21, β * vecload(V, C, ptrĈ, 2, 1))
-        Ĉ12 = fma(α, Ĉ12, β * vecload(V, C, ptrĈ, 1, 2))
-        Ĉ22 = fma(α, Ĉ22, β * vecload(V, C, ptrĈ, 2, 2))
-        Ĉ13 = fma(α, Ĉ13, β * vecload(V, C, ptrĈ, 1, 3))
-        Ĉ23 = fma(α, Ĉ23, β * vecload(V, C, ptrĈ, 2, 3))
-        Ĉ14 = fma(α, Ĉ14, β * vecload(V, C, ptrĈ, 1, 4))
-        Ĉ24 = fma(α, Ĉ24, β * vecload(V, C, ptrĈ, 2, 4))
-        Ĉ15 = fma(α, Ĉ15, β * vecload(V, C, ptrĈ, 1, 5))
-        Ĉ25 = fma(α, Ĉ25, β * vecload(V, C, ptrĈ, 2, 5))
-        Ĉ16 = fma(α, Ĉ16, β * vecload(V, C, ptrĈ, 1, 6))
-        Ĉ26 = fma(α, Ĉ26, β * vecload(V, C, ptrĈ, 2, 6))
-        vecstore(Ĉ11, C, ptrĈ, 1, 1)
-        vecstore(Ĉ21, C, ptrĈ, 2, 1)
-        vecstore(Ĉ12, C, ptrĈ, 1, 2)
-        vecstore(Ĉ22, C, ptrĈ, 2, 2)
-        vecstore(Ĉ13, C, ptrĈ, 1, 3)
-        vecstore(Ĉ23, C, ptrĈ, 2, 3)
-        vecstore(Ĉ14, C, ptrĈ, 1, 4)
-        vecstore(Ĉ24, C, ptrĈ, 2, 4)
-        vecstore(Ĉ15, C, ptrĈ, 1, 5)
-        vecstore(Ĉ25, C, ptrĈ, 2, 5)
-        vecstore(Ĉ16, C, ptrĈ, 1, 6)
-        vecstore(Ĉ26, C, ptrĈ, 2, 6)
+        vecstore(fma(α, Ĉ11, β * vecload(V, C, ptrĈ, 1, 1)), C, ptrĈ, 1, 1)
+        vecstore(fma(α, Ĉ21, β * vecload(V, C, ptrĈ, 2, 1)), C, ptrĈ, 2, 1)
+        vecstore(fma(α, Ĉ12, β * vecload(V, C, ptrĈ, 1, 2)), C, ptrĈ, 1, 2)
+        vecstore(fma(α, Ĉ22, β * vecload(V, C, ptrĈ, 2, 2)), C, ptrĈ, 2, 2)
+        vecstore(fma(α, Ĉ13, β * vecload(V, C, ptrĈ, 1, 3)), C, ptrĈ, 1, 3)
+        vecstore(fma(α, Ĉ23, β * vecload(V, C, ptrĈ, 2, 3)), C, ptrĈ, 2, 3)
+        vecstore(fma(α, Ĉ14, β * vecload(V, C, ptrĈ, 1, 4)), C, ptrĈ, 1, 4)
+        vecstore(fma(α, Ĉ24, β * vecload(V, C, ptrĈ, 2, 4)), C, ptrĈ, 2, 4)
+        vecstore(fma(α, Ĉ15, β * vecload(V, C, ptrĈ, 1, 5)), C, ptrĈ, 1, 5)
+        vecstore(fma(α, Ĉ25, β * vecload(V, C, ptrĈ, 2, 5)), C, ptrĈ, 2, 5)
+        vecstore(fma(α, Ĉ16, β * vecload(V, C, ptrĈ, 1, 6)), C, ptrĈ, 1, 6)
+        vecstore(fma(α, Ĉ26, β * vecload(V, C, ptrĈ, 2, 6)), C, ptrĈ, 2, 6)
     end
 
     return nothing
