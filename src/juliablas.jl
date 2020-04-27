@@ -71,7 +71,7 @@ end
 ### Micro kernel
 ###
 
-@inline function tiling_microkernel!(C::SIMD.FastContiguousArray{Float64}, A::SIMD.FastContiguousArray{Float64}, B::SIMD.FastContiguousArray{Float64},
+@noinline function tiling_microkernel!(C::SIMD.FastContiguousArray{Float64}, A::SIMD.FastContiguousArray{Float64}, B::SIMD.FastContiguousArray{Float64},
                                      i, j, pstart, pend, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     T = Float64
     N = 4
@@ -81,6 +81,7 @@ end
     #mm = 2#micro_m ÷ N
     #mn = 4#micro_n
     #ĈT = NTuple{mm,V}
+    punroll, pleft = divrem(pend - pstart + 1, 8)
 
     ptrĈ = getptr(C, i, j) # pointer with offset
     #Ĉ = ntuple(Val(mn)) do j
@@ -106,7 +107,8 @@ end
     Ĉ16 = vecload(V, C, ptrĈ, 1, 6)
     Ĉ26 = vecload(V, C, ptrĈ, 2, 6)
 
-    for p in pstart:8:pend
+    p = pstart
+    for _ in 1:punroll
         # rank-1 update
         ptrÂ = getptr(A, i, p)
         #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT
@@ -345,6 +347,39 @@ end
         B6 = V(@inbounds B[p, j+5])
         Ĉ16 = fma(Â1, B6, Ĉ16)
         Ĉ26 = fma(Â2, B6, Ĉ26)
+        p += 1
+    end
+
+    for _ in 1:pleft
+        # rank-1 update
+        ptrÂ = getptr(A, i, p)
+        #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT
+        Â1 = vecload(V, A, ptrÂ, i, 1)
+        Â2 = vecload(V, A, ptrÂ, i+1, 1)
+        #Ĉ = ntuple(mn) do k
+        #    Ĉk = Ĉ[k]::ĈT
+        #    Bpj = V(@inbounds B[p, j+k-1])::V
+        #    Ĉk = ntuple(i->fma(Aip[i], Bpj, Ĉ[k][i]), Val(mm))::ĈT
+        #end::NTuple{mn,ĈT}
+        B1 = V(@inbounds B[p, j])
+        Ĉ11 = fma(Â1, B1, Ĉ11)
+        Ĉ21 = fma(Â2, B1, Ĉ21)
+        B2 = V(@inbounds B[p, j+1])
+        Ĉ12 = fma(Â1, B2, Ĉ12)
+        Ĉ22 = fma(Â2, B2, Ĉ22)
+        B3 = V(@inbounds B[p, j+2])
+        Ĉ13 = fma(Â1, B3, Ĉ13)
+        Ĉ23 = fma(Â2, B3, Ĉ23)
+        B4 = V(@inbounds B[p, j+3])
+        Ĉ14 = fma(Â1, B4, Ĉ14)
+        Ĉ24 = fma(Â2, B4, Ĉ24)
+        B5 = V(@inbounds B[p, j+4])
+        Ĉ15 = fma(Â1, B5, Ĉ15)
+        Ĉ25 = fma(Â2, B5, Ĉ25)
+        B6 = V(@inbounds B[p, j+5])
+        Ĉ16 = fma(Â1, B6, Ĉ16)
+        Ĉ26 = fma(Â2, B6, Ĉ26)
+        p += 1
     end
 
     vecstore(Ĉ11, C, ptrĈ, 1, 1)
