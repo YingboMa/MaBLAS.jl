@@ -46,7 +46,6 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
                 # macrokernel
                 for microjstart in cachejstart:micro_n:cachejend, microistart in cacheistart:micro_m:cacheiend
                     # (micro_m × micro_n) = (micro_m × ks) * (ks × micro_n)
-                    ps = cachepstart:cachepend
                     # C[i:(i+micro_m-1)] = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
                     tiling_microkernel!(C, A, B, microistart, microjstart, cachepstart, cachepend, kernel_params)
                 end
@@ -107,7 +106,127 @@ end
     Ĉ16 = vecload(V, C, ptrĈ, 1, 6)
     Ĉ26 = vecload(V, C, ptrĈ, 2, 6)
 
-    for p in pstart:4:pend
+    for p in pstart:8:pend
+        # rank-1 update
+        ptrÂ = getptr(A, i, p)
+        #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT
+        Â1 = vecload(V, A, ptrÂ, i, 1)
+        Â2 = vecload(V, A, ptrÂ, i+1, 1)
+        #Ĉ = ntuple(mn) do k
+        #    Ĉk = Ĉ[k]::ĈT
+        #    Bpj = V(@inbounds B[p, j+k-1])::V
+        #    Ĉk = ntuple(i->fma(Aip[i], Bpj, Ĉ[k][i]), Val(mm))::ĈT
+        #end::NTuple{mn,ĈT}
+        B1 = V(@inbounds B[p, j])
+        Ĉ11 = fma(Â1, B1, Ĉ11)
+        Ĉ21 = fma(Â2, B1, Ĉ21)
+        B2 = V(@inbounds B[p, j+1])
+        Ĉ12 = fma(Â1, B2, Ĉ12)
+        Ĉ22 = fma(Â2, B2, Ĉ22)
+        B3 = V(@inbounds B[p, j+2])
+        Ĉ13 = fma(Â1, B3, Ĉ13)
+        Ĉ23 = fma(Â2, B3, Ĉ23)
+        B4 = V(@inbounds B[p, j+3])
+        Ĉ14 = fma(Â1, B4, Ĉ14)
+        Ĉ24 = fma(Â2, B4, Ĉ24)
+        B5 = V(@inbounds B[p, j+4])
+        Ĉ15 = fma(Â1, B5, Ĉ15)
+        Ĉ25 = fma(Â2, B5, Ĉ25)
+        B6 = V(@inbounds B[p, j+5])
+        Ĉ16 = fma(Â1, B6, Ĉ16)
+        Ĉ26 = fma(Â2, B6, Ĉ26)
+
+        p+=1
+        # rank-1 update
+        ptrÂ = getptr(A, i, p)
+        #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT
+        Â1 = vecload(V, A, ptrÂ, i, 1)
+        Â2 = vecload(V, A, ptrÂ, i+1, 1)
+        #Ĉ = ntuple(mn) do k
+        #    Ĉk = Ĉ[k]::ĈT
+        #    Bpj = V(@inbounds B[p, j+k-1])::V
+        #    Ĉk = ntuple(i->fma(Aip[i], Bpj, Ĉ[k][i]), Val(mm))::ĈT
+        #end::NTuple{mn,ĈT}
+        B1 = V(@inbounds B[p, j])
+        Ĉ11 = fma(Â1, B1, Ĉ11)
+        Ĉ21 = fma(Â2, B1, Ĉ21)
+        B2 = V(@inbounds B[p, j+1])
+        Ĉ12 = fma(Â1, B2, Ĉ12)
+        Ĉ22 = fma(Â2, B2, Ĉ22)
+        B3 = V(@inbounds B[p, j+2])
+        Ĉ13 = fma(Â1, B3, Ĉ13)
+        Ĉ23 = fma(Â2, B3, Ĉ23)
+        B4 = V(@inbounds B[p, j+3])
+        Ĉ14 = fma(Â1, B4, Ĉ14)
+        Ĉ24 = fma(Â2, B4, Ĉ24)
+        B5 = V(@inbounds B[p, j+4])
+        Ĉ15 = fma(Â1, B5, Ĉ15)
+        Ĉ25 = fma(Â2, B5, Ĉ25)
+        B6 = V(@inbounds B[p, j+5])
+        Ĉ16 = fma(Â1, B6, Ĉ16)
+        Ĉ26 = fma(Â2, B6, Ĉ26)
+
+        p+=1
+        # rank-1 update
+        ptrÂ = getptr(A, i, p)
+        #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT
+        Â1 = vecload(V, A, ptrÂ, i, 1)
+        Â2 = vecload(V, A, ptrÂ, i+1, 1)
+        #Ĉ = ntuple(mn) do k
+        #    Ĉk = Ĉ[k]::ĈT
+        #    Bpj = V(@inbounds B[p, j+k-1])::V
+        #    Ĉk = ntuple(i->fma(Aip[i], Bpj, Ĉ[k][i]), Val(mm))::ĈT
+        #end::NTuple{mn,ĈT}
+        B1 = V(@inbounds B[p, j])
+        Ĉ11 = fma(Â1, B1, Ĉ11)
+        Ĉ21 = fma(Â2, B1, Ĉ21)
+        B2 = V(@inbounds B[p, j+1])
+        Ĉ12 = fma(Â1, B2, Ĉ12)
+        Ĉ22 = fma(Â2, B2, Ĉ22)
+        B3 = V(@inbounds B[p, j+2])
+        Ĉ13 = fma(Â1, B3, Ĉ13)
+        Ĉ23 = fma(Â2, B3, Ĉ23)
+        B4 = V(@inbounds B[p, j+3])
+        Ĉ14 = fma(Â1, B4, Ĉ14)
+        Ĉ24 = fma(Â2, B4, Ĉ24)
+        B5 = V(@inbounds B[p, j+4])
+        Ĉ15 = fma(Â1, B5, Ĉ15)
+        Ĉ25 = fma(Â2, B5, Ĉ25)
+        B6 = V(@inbounds B[p, j+5])
+        Ĉ16 = fma(Â1, B6, Ĉ16)
+        Ĉ26 = fma(Â2, B6, Ĉ26)
+
+        p+=1
+        # rank-1 update
+        ptrÂ = getptr(A, i, p)
+        #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT
+        Â1 = vecload(V, A, ptrÂ, i, 1)
+        Â2 = vecload(V, A, ptrÂ, i+1, 1)
+        #Ĉ = ntuple(mn) do k
+        #    Ĉk = Ĉ[k]::ĈT
+        #    Bpj = V(@inbounds B[p, j+k-1])::V
+        #    Ĉk = ntuple(i->fma(Aip[i], Bpj, Ĉ[k][i]), Val(mm))::ĈT
+        #end::NTuple{mn,ĈT}
+        B1 = V(@inbounds B[p, j])
+        Ĉ11 = fma(Â1, B1, Ĉ11)
+        Ĉ21 = fma(Â2, B1, Ĉ21)
+        B2 = V(@inbounds B[p, j+1])
+        Ĉ12 = fma(Â1, B2, Ĉ12)
+        Ĉ22 = fma(Â2, B2, Ĉ22)
+        B3 = V(@inbounds B[p, j+2])
+        Ĉ13 = fma(Â1, B3, Ĉ13)
+        Ĉ23 = fma(Â2, B3, Ĉ23)
+        B4 = V(@inbounds B[p, j+3])
+        Ĉ14 = fma(Â1, B4, Ĉ14)
+        Ĉ24 = fma(Â2, B4, Ĉ24)
+        B5 = V(@inbounds B[p, j+4])
+        Ĉ15 = fma(Â1, B5, Ĉ15)
+        Ĉ25 = fma(Â2, B5, Ĉ25)
+        B6 = V(@inbounds B[p, j+5])
+        Ĉ16 = fma(Â1, B6, Ĉ16)
+        Ĉ26 = fma(Â2, B6, Ĉ26)
+
+        p+=1
         # rank-1 update
         ptrÂ = getptr(A, i, p)
         #Aip = ntuple(i->vecload(V, A, ptrÂ, i, 1)::V, Val(mm))::ĈT

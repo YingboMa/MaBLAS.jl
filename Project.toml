@@ -1,4 +1,4 @@
-name = "SmallLinearAlgbra"
+name = "SmallLinearAlgebra"
 uuid = "42749426-4a14-4e48-b862-652cce965524"
 authors = ["Yingbo Ma <mayingbo5@gmail.com>"]
 version = "0.1.0"

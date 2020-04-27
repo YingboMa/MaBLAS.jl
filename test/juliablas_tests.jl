@@ -1,7 +1,7 @@
 using Test
-using SmallLinearAlgbra
+using SmallLinearAlgebra
 
 @testset "Size check" begin
     C = randn(12, 11); A = rand(2, 3); B = rand(2, 3)
-    @test_throws DimensionMismatch SmallLinearAlgbra.mul!(C, A, B)
+    @test_throws DimensionMismatch SmallLinearAlgebra.mul!(C, A, B)
 end

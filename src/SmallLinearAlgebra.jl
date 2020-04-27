@@ -1,4 +1,4 @@
-module SmallLinearAlgbra
+module SmallLinearAlgebra
 
 # general design philosophy:
 #   1: keep the number of defined types in check
