@@ -93,6 +93,7 @@ end
     sv = sizeof(V)
     sa2 = stride(A, 2)*st
     sb2 = stride(B, 2)*st
+    sc2 = stride(C, 2)*st
     # we unroll 8 times
     punroll, pleft = divrem(pend - pstart + 1, 8)
 
@@ -114,7 +115,16 @@ end
     p = pstart
     ptrÂ = getptr(A, i, p)
     ptrB̂ = getptr(B, p, j)
+
+    # prefetch C matrix
+    prefetcht0(ptrĈ)
+    prefetcht0(ptrĈ +  sc2)
+    prefetcht0(ptrĈ + 2sc2)
+    prefetcht0(ptrĈ + 3sc2)
+    prefetcht0(ptrĈ + 4sc2)
+    prefetcht0(ptrĈ + 5sc2)
     for _ in 1:punroll
+        prefetcht0(ptrÂ + 8sa2)
         @nexprs 8 u -> begin
             # iteration u
             Â1 = vload(V, ptrÂ + (u - 1) * sa2)
@@ -228,3 +238,9 @@ end
     vstore(v, ptr + ii*sizeof(T))
     return nothing
 end
+
+prefetcht0(ptr::Ptr) = Base.llvmcall(raw"""
+                                     %ptr = inttoptr i64 %0 to i8*
+                                     call void asm sideeffect "prefetcht0 $0", "*m,~{dirflag},~{fpsr},~{flags}"(i8* nonnull %ptr)
+                                     ret void
+                                     """, Cvoid, Tuple{Ptr{Cvoid}}, convert(Ptr{Cvoid}, ptr))
