@@ -18,7 +18,7 @@ using StaticArrays
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false)
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080))
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
         return fill!(C, zero(eltype(C)))
@@ -34,7 +34,6 @@ function mul!(C, A, B, α=true, β=false)
         return C
     end
     # assume Float64 for now
-    cache_params = (cache_m=72, cache_k=256, cache_n=4080)
     kernel_params = (Val(8), Val(6))
     return tiling_mul!(C, A, B, α, β, cache_params, kernel_params)
 end
@@ -55,6 +54,7 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
         cachejend = min(cachejstart + cache_n - 1, n)
         for cachepstart in 1:cache_k:k
             cachepend = min(cachepstart + cache_k - 1, k)
+            _β = cachepstart == 1 ? β : one(β)
             for cacheistart in 1:cache_m:m
                 cacheiend = min(cacheistart + cache_m - 1, m)
                 # macrokernel
@@ -65,11 +65,11 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
                         if nleft >= micro_n && mleft >= micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            tiling_microkernel!(C, A, B, α, β, microistart, microjstart, cachepstart, cachepend, kernel_params)
+                            tiling_microkernel!(C, A, B, α, _β, microistart, microjstart, cachepstart, cachepend, kernel_params)
                         else
                             # (mleft × ks) * (ks × nleft)
                             # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-                            cleanup_tiling_microkernel!(C, A, B, α, β, microistart, microjstart, cachepstart, cachepend, mleft, nleft)
+                            cleanup_tiling_microkernel!(C, A, B, α, _β, microistart, microjstart, cachepstart, cachepend, mleft, nleft)
                         end
                     end # microi
                 end # microj
@@ -232,7 +232,7 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, pstart, pend, mleft,
         @simd ivdep for p̂ in pstart:pend
             ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
         end
-        C[î, ĵ] = iszeroβ ? α * ABîĵ : muladd(α, ABîĵ, C[î, ĵ])
+        C[î, ĵ] = iszeroβ ? α * ABîĵ : muladd(α, ABîĵ, β * C[î, ĵ])
     end
     return nothing
 end
