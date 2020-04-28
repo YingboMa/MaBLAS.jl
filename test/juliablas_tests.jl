@@ -32,3 +32,11 @@ end
         @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
 end
+
+@testset "View of matrix" begin
+    V = randn(10, 10)
+    A = @view V[1:5,  1:5]
+    B = @view V[6:10, 1:5]
+    C = @view V[1:5, 6:10]
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B)
+end

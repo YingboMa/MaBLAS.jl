@@ -95,7 +95,9 @@ end
 ### Micro kernel
 ###
 
-@noinline function tiling_microkernel!(C::SIMD.FastContiguousArray{Float64}, A::SIMD.FastContiguousArray{Float64}, B::SIMD.FastContiguousArray{Float64}, α, β,
+# (micro_m × ks) * (ks × micro_n)
+# Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
+@noinline function tiling_microkernel!(C::StridedMatrix{Float64}, A::StridedMatrix{Float64}, B::StridedMatrix{Float64}, α, β,
                                      i, j, pstart, pend, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     T = Float64
     N = 4
@@ -249,13 +251,13 @@ function checkmulsize(C, A, B)
     return cm, ak, bn
 end
 
-@inline getptr(A::SIMD.FastContiguousArray, i, j) = pointer(A, (j - 1) * stride(A, 2) + i)
+@inline getptr(A::StridedMatrix, i, j) = pointer(A, (j - 1) * stride(A, 2) + i)
 
-@inline function vecload(V::Type{Vec{N,T}}, A::SIMD.FastContiguousArray, ptr::Ptr{T}, i, j)::V where {N,T}
+@inline function vecload(V::Type{Vec{N,T}}, A::StridedMatrix, ptr::Ptr{T}, i, j)::V where {N,T}
     ii = (j - 1) * stride(A, 2) + (i - 1) * N
     return vload(V, ptr + ii*sizeof(T))
 end
-@inline function vecstore(v::Vec{N,T}, A::SIMD.FastContiguousArray, ptr::Ptr{T}, i, j) where {N,T}
+@inline function vecstore(v::Vec{N,T}, A::StridedMatrix, ptr::Ptr{T}, i, j) where {N,T}
     ii = (j - 1) * stride(A, 2) + (i - 1) * N
     vstore(v, ptr + ii*sizeof(T))
     return nothing
