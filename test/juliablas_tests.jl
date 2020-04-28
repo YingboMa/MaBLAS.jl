@@ -8,7 +8,7 @@ using LinearAlgebra
 end
 
 @testset "Kernel sized matmul" begin
-    m, k, n = 8, 83, 30
+    m, k, n = 8*3, 83, 6*7
     C = rand(m, n)
     A = rand(m, k)
     B = rand(k, n)
