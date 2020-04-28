@@ -1,6 +1,7 @@
 using SIMD
 using LinearAlgebra: Transpose, Adjoint
 using Base.Cartesian: @nexprs
+using StaticArrays
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -57,11 +58,21 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
             for cacheistart in 1:cache_m:m
                 cacheiend = min(cacheistart + cache_m - 1, m)
                 # macrokernel
-                for microjstart in cachejstart:micro_n:cachejend, microistart in cacheistart:micro_m:cacheiend
-                    # (micro_m × micro_n) = (micro_m × ks) * (ks × micro_n)
-                    # C[i:(i+micro_m-1)] = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                    tiling_microkernel!(C, A, B, α, β, microistart, microjstart, cachepstart, cachepend, kernel_params)
-                end
+                for microjstart in cachejstart:micro_n:cachejend
+                    nleft = min(cachejend - microjstart + 1, micro_n)
+                    for microistart in cacheistart:micro_m:cacheiend
+                        mleft = min(cacheiend - microistart + 1, micro_m)
+                        if nleft >= micro_n && mleft >= micro_m
+                            # (micro_m × ks) * (ks × micro_n)
+                            # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
+                            tiling_microkernel!(C, A, B, α, β, microistart, microjstart, cachepstart, cachepend, kernel_params)
+                        else
+                            # (mleft × ks) * (ks × nleft)
+                            # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
+                            cleanup_tiling_microkernel!(C, A, B, α, β, microistart, microjstart, cachepstart, cachepend, mleft, nleft)
+                        end
+                    end # microi
+                end # microj
             end # cachei
         end # cachep
     end # cachej
@@ -180,7 +191,7 @@ end
         ptrB̂ += st # sb1
     end
 
-    if β === false
+    if iszero(β)
         vecstore(α * Ĉ11, C, ptrĈ, 1, 1)
         vecstore(α * Ĉ21, C, ptrĈ, 2, 1)
         vecstore(α * Ĉ12, C, ptrĈ, 1, 2)
@@ -212,7 +223,18 @@ end
 end
 #TODO: (A'B), AB', and A'B'
 
-function microkernel!
+# (mleft × nleft) = (mleft × ks) * (ks × nleft)
+# Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
+function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, pstart, pend, mleft, nleft)
+    iszeroβ = iszero(β)
+    @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+        ABîĵ = zero(eltype(C))
+        @simd ivdep for p̂ in pstart:pend
+            ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+        end
+        C[î, ĵ] = iszeroβ ? α * ABîĵ : muladd(α, ABîĵ, C[î, ĵ])
+    end
+    return nothing
 end
 
 ###
@@ -241,6 +263,6 @@ end
 
 prefetcht0(ptr::Ptr) = Base.llvmcall(raw"""
                                      %ptr = inttoptr i64 %0 to i8*
-                                     call void asm sideeffect "prefetcht0 $0", "*m,~{dirflag},~{fpsr},~{flags}"(i8* nonnull %ptr)
+                                     call void asm "prefetcht0 $0", "*m"(i8* nonnull %ptr)
                                      ret void
                                      """, Cvoid, Tuple{Ptr{Cvoid}}, convert(Ptr{Cvoid}, ptr))
