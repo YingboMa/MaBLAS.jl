@@ -91,7 +91,9 @@ end
     V = Vec{N, T}
     st = sizeof(T)
     sv = sizeof(V)
-    incA = stride(A, 2)*st
+    sa2 = stride(A, 2)*st
+    sb2 = stride(B, 2)*st
+    # we unroll 8 times
     punroll, pleft = divrem(pend - pstart + 1, 8)
 
     ptrĈ = getptr(C, i, j) # pointer with offset
@@ -111,57 +113,61 @@ end
     # rank-1 updates
     p = pstart
     ptrÂ = getptr(A, i, p)
+    ptrB̂ = getptr(B, p, j)
     for _ in 1:punroll
         @nexprs 8 u -> begin
             # iteration u
-            Â1 = vecload(V, A, ptrÂ + (u - 1) * incA, 1, 1)
-            Â2 = vecload(V, A, ptrÂ + (u - 1) * incA, 2, 1)
-            B1 = V(@inbounds B[p + (u - 1), j])
+            Â1 = vload(V, ptrÂ + (u - 1) * sa2)
+            Â2 = vload(V, ptrÂ + (u - 1) * sa2 + sv)
+            #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
+            B1 = V(unsafe_load(ptrB̂ + (u - 1) * st))
             Ĉ11 = fma(Â1, B1, Ĉ11)
             Ĉ21 = fma(Â2, B1, Ĉ21)
-            B2 = V(@inbounds B[p + (u - 1), j + 1])
+            B2 = V(unsafe_load(ptrB̂ + (u - 1) * st + sb2))
             Ĉ12 = fma(Â1, B2, Ĉ12)
             Ĉ22 = fma(Â2, B2, Ĉ22)
-            B3 = V(@inbounds B[p + (u - 1), j + 2])
+            B3 = V(unsafe_load(ptrB̂ + (u - 1) * st + 2sb2))
             Ĉ13 = fma(Â1, B3, Ĉ13)
             Ĉ23 = fma(Â2, B3, Ĉ23)
-            B4 = V(@inbounds B[p + (u - 1), j + 3])
+            B4 = V(unsafe_load(ptrB̂ + (u - 1) * st + 3sb2))
             Ĉ14 = fma(Â1, B4, Ĉ14)
             Ĉ24 = fma(Â2, B4, Ĉ24)
-            B5 = V(@inbounds B[p + (u - 1), j + 4])
+            B5 = V(unsafe_load(ptrB̂ + (u - 1) * st + 4sb2))
             Ĉ15 = fma(Â1, B5, Ĉ15)
             Ĉ25 = fma(Â2, B5, Ĉ25)
-            B6 = V(@inbounds B[p + (u - 1), j + 5])
+            B6 = V(unsafe_load(ptrB̂ + (u - 1) * st + 5sb2))
             Ĉ16 = fma(Â1, B6, Ĉ16)
             Ĉ26 = fma(Â2, B6, Ĉ26)
         end
         p += 8
-        ptrÂ += 8incA
+        ptrÂ += 8sa2
+        ptrB̂ += 8st # sb1
     end
 
     for _ in 1:pleft
-        Â1 = vecload(V, A, ptrÂ, 1, 1)
-        Â2 = vecload(V, A, ptrÂ, 2, 1)
-        B1 = V(@inbounds B[p, j])
+        Â1 = vload(V, ptrÂ)
+        Â2 = vload(V, ptrÂ + sv)
+        B1 = V(unsafe_load(ptrB̂))
         Ĉ11 = fma(Â1, B1, Ĉ11)
         Ĉ21 = fma(Â2, B1, Ĉ21)
-        B2 = V(@inbounds B[p, j+1])
+        B2 = V(unsafe_load(ptrB̂ + sb2))
         Ĉ12 = fma(Â1, B2, Ĉ12)
         Ĉ22 = fma(Â2, B2, Ĉ22)
-        B3 = V(@inbounds B[p, j+2])
+        B3 = V(unsafe_load(ptrB̂ + 2sb2))
         Ĉ13 = fma(Â1, B3, Ĉ13)
         Ĉ23 = fma(Â2, B3, Ĉ23)
-        B4 = V(@inbounds B[p, j+3])
+        B4 = V(unsafe_load(ptrB̂ + 3sb2))
         Ĉ14 = fma(Â1, B4, Ĉ14)
         Ĉ24 = fma(Â2, B4, Ĉ24)
-        B5 = V(@inbounds B[p, j+4])
+        B5 = V(unsafe_load(ptrB̂ + 4sb2))
         Ĉ15 = fma(Â1, B5, Ĉ15)
         Ĉ25 = fma(Â2, B5, Ĉ25)
-        B6 = V(@inbounds B[p, j+5])
+        B6 = V(unsafe_load(ptrB̂ + 5sb2))
         Ĉ16 = fma(Â1, B6, Ĉ16)
         Ĉ26 = fma(Â2, B6, Ĉ26)
         p += 1
-        ptrÂ += incA
+        ptrÂ += sa2
+        ptrB̂ += st # sb1
     end
 
     if β === false
