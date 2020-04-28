@@ -8,11 +8,27 @@ using LinearAlgebra
 end
 
 @testset "Kernel sized matmul" begin
-    m, k, n = 8*3, 83, 6*7
+    _m, _k, _n = 8*3, 8, 6*5
+    # lower cache_params to check multiple of cache sizes more easily
+    cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
+    m, k, n = _m*2, _k*3, _n*5
     C = rand(m, n)
     A = rand(m, k)
     B = rand(k, n)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true)
-        @test SmallLinearAlgebra.mul!((copy(C)), A, B, 2, 3) ≈ LinearAlgebra.mul!((copy(C)), A, B, 2, 3)
+        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+    end
+end
+
+@testset "Clean up loop tests" begin
+    _m, _k, _n = 8*3, 8, 6*5
+    # lower cache_params to check clean up loops more easily
+    cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
+    m, k, n = 73, 131, 257 # all prime numbers
+    C = rand(m, n)
+    A = rand(m, k)
+    B = rand(k, n)
+    for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true)
+        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
 end
