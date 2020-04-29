@@ -68,7 +68,7 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            packing_microkernel!(C, Abuffer, Bbuffer, α, _β, Coffset, Aoffset, Boffset, ps, kernel_params)
+                            packing_microkernel_simple!(C, Abuffer, Bbuffer, α, _β, Coffset, Aoffset, Boffset, ps, kernel_params)
                         else
                             # (mleft × ks) * (ks × nleft)
                             # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
@@ -159,7 +159,7 @@ function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, mi
         else # a panel is not full
             for p in cachep₁:cachep₂ # iterate through panel columns
                 for j in j₁:cachej₂  # iterate through live panel rows
-                    @inbounds Bbuffer[l += 1] = B[i, p]
+                    @inbounds Bbuffer[l += 1] = B[p, j]
                 end
                 for j in (j₂ + 1):j₂ # pad the rest of the panel with zero
                     @inbounds Bbuffer[l += 1] = zero(eltype(Bbuffer))
@@ -174,15 +174,108 @@ end
 ### Micro kernel
 ###
 
-@noinline function packing_microkernel!(C::StridedMatrix{Float64}, Abuffer::StridedVector{Float64}, Bbuffer::StridedVector{Float64}, α, β,
-                                        Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+@noinline function packing_microkernel_simple!(C::StridedMatrix{Float64}, Abuffer::StridedVector{Float64}, Bbuffer::StridedVector{Float64}, α, β,
+                                               Coffset, Aoffset, Boffset, ps, ::Tuple{Val{8},Val{6}})
     T = Float64
     N = 4
     V = Vec{N, T}
     st = sizeof(T)
     sv = sizeof(V)
     sc2 = stride(C, 2)*st
-    # we unroll 8 times
+    micro_m, micro_n = 8, 6
+
+    ptrĈ = pointer(C) + Coffset * st # pointer with offset
+    Ĉ11 = zero(V)
+    Ĉ21 = zero(V)
+    Ĉ12 = zero(V)
+    Ĉ22 = zero(V)
+    Ĉ13 = zero(V)
+    Ĉ23 = zero(V)
+    Ĉ14 = zero(V)
+    Ĉ24 = zero(V)
+    Ĉ15 = zero(V)
+    Ĉ25 = zero(V)
+    Ĉ16 = zero(V)
+    Ĉ26 = zero(V)
+
+    ptrÂ = pointer(Abuffer) + Aoffset * st
+    ptrB̂ = pointer(Bbuffer) + Boffset * st
+
+    # prefetch C matrix
+    prefetcht0(ptrĈ)
+    prefetcht0(ptrĈ +  sc2)
+    prefetcht0(ptrĈ + 2sc2)
+    prefetcht0(ptrĈ + 3sc2)
+    prefetcht0(ptrĈ + 4sc2)
+    prefetcht0(ptrĈ + 5sc2)
+    # rank-1 updates
+
+    for _ in 1:ps
+        Â1 = vload(V, ptrÂ)
+        Â2 = vload(V, ptrÂ + sv)
+        B1 = V(unsafe_load(ptrB̂))
+        Ĉ11 = fma(Â1, B1, Ĉ11)
+        Ĉ21 = fma(Â2, B1, Ĉ21)
+        B2 = V(unsafe_load(ptrB̂ + st))
+        Ĉ12 = fma(Â1, B2, Ĉ12)
+        Ĉ22 = fma(Â2, B2, Ĉ22)
+        B3 = V(unsafe_load(ptrB̂ + 2st))
+        Ĉ13 = fma(Â1, B3, Ĉ13)
+        Ĉ23 = fma(Â2, B3, Ĉ23)
+        B4 = V(unsafe_load(ptrB̂ + 3st))
+        Ĉ14 = fma(Â1, B4, Ĉ14)
+        Ĉ24 = fma(Â2, B4, Ĉ24)
+        B5 = V(unsafe_load(ptrB̂ + 4st))
+        Ĉ15 = fma(Â1, B5, Ĉ15)
+        Ĉ25 = fma(Â2, B5, Ĉ25)
+        B6 = V(unsafe_load(ptrB̂ + 5st))
+        Ĉ16 = fma(Â1, B6, Ĉ16)
+        Ĉ26 = fma(Â2, B6, Ĉ26)
+        ptrÂ += st * micro_m
+        ptrB̂ += st * micro_n
+    end
+
+    if iszero(β)
+        vecstore(α * Ĉ11, C, ptrĈ, 1, 1)
+        vecstore(α * Ĉ21, C, ptrĈ, 2, 1)
+        vecstore(α * Ĉ12, C, ptrĈ, 1, 2)
+        vecstore(α * Ĉ22, C, ptrĈ, 2, 2)
+        vecstore(α * Ĉ13, C, ptrĈ, 1, 3)
+        vecstore(α * Ĉ23, C, ptrĈ, 2, 3)
+        vecstore(α * Ĉ14, C, ptrĈ, 1, 4)
+        vecstore(α * Ĉ24, C, ptrĈ, 2, 4)
+        vecstore(α * Ĉ15, C, ptrĈ, 1, 5)
+        vecstore(α * Ĉ25, C, ptrĈ, 2, 5)
+        vecstore(α * Ĉ16, C, ptrĈ, 1, 6)
+        vecstore(α * Ĉ26, C, ptrĈ, 2, 6)
+    else
+        vecstore(fma(α, Ĉ11, β * vecload(V, C, ptrĈ, 1, 1)), C, ptrĈ, 1, 1)
+        vecstore(fma(α, Ĉ21, β * vecload(V, C, ptrĈ, 2, 1)), C, ptrĈ, 2, 1)
+        vecstore(fma(α, Ĉ12, β * vecload(V, C, ptrĈ, 1, 2)), C, ptrĈ, 1, 2)
+        vecstore(fma(α, Ĉ22, β * vecload(V, C, ptrĈ, 2, 2)), C, ptrĈ, 2, 2)
+        vecstore(fma(α, Ĉ13, β * vecload(V, C, ptrĈ, 1, 3)), C, ptrĈ, 1, 3)
+        vecstore(fma(α, Ĉ23, β * vecload(V, C, ptrĈ, 2, 3)), C, ptrĈ, 2, 3)
+        vecstore(fma(α, Ĉ14, β * vecload(V, C, ptrĈ, 1, 4)), C, ptrĈ, 1, 4)
+        vecstore(fma(α, Ĉ24, β * vecload(V, C, ptrĈ, 2, 4)), C, ptrĈ, 2, 4)
+        vecstore(fma(α, Ĉ15, β * vecload(V, C, ptrĈ, 1, 5)), C, ptrĈ, 1, 5)
+        vecstore(fma(α, Ĉ25, β * vecload(V, C, ptrĈ, 2, 5)), C, ptrĈ, 2, 5)
+        vecstore(fma(α, Ĉ16, β * vecload(V, C, ptrĈ, 1, 6)), C, ptrĈ, 1, 6)
+        vecstore(fma(α, Ĉ26, β * vecload(V, C, ptrĈ, 2, 6)), C, ptrĈ, 2, 6)
+    end
+
+    return nothing
+end
+
+@noinline function packing_microkernel!(C::StridedMatrix{Float64}, Abuffer::StridedVector{Float64}, Bbuffer::StridedVector{Float64}, α, β,
+                                        Coffset, Aoffset, Boffset, ps, ::Tuple{Val{8},Val{6}})
+    T = Float64
+    N = 4
+    V = Vec{N, T}
+    st = sizeof(T)
+    sv = sizeof(V)
+    sc2 = stride(C, 2)*st
+    micro_m, micro_n = 8, 6
+    # we unroll 16 times
     unroll = 16
     punroll, pleft = divrem(ps, unroll)
 
@@ -300,7 +393,7 @@ end
 # (micro_m × ks) * (ks × micro_n)
 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
 @noinline function tiling_microkernel!(C::StridedMatrix{Float64}, A::StridedMatrix{Float64}, B::StridedMatrix{Float64}, α, β,
-                                     i, j, p₁, p₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+                                       i, j, p₁, p₂, ::Tuple{Val{8},Val{6}})
     T = Float64
     N = 4
     V = Vec{N, T}
@@ -309,6 +402,7 @@ end
     sa2 = stride(A, 2)*st
     sb2 = stride(B, 2)*st
     sc2 = stride(C, 2)*st
+    micro_m, micro_n = 8, 6
     # we unroll 8 times
     punroll, pleft = divrem(p₂ - p₁ + 1, 8)
 
