@@ -178,8 +178,9 @@ end
     sv = sizeof(V)
     sc2 = stride(C, 2)*st
     # we unroll 8 times
+    unroll = 16
     piters = cachep₂ - cachep₁ + 1
-    punroll, pleft = divrem(piters, 8)
+    punroll, pleft = divrem(piters, unroll)
 
     ptrĈ = getptr(C, microi₁, microj₁) # pointer with offset
     Ĉ11 = zero(V)
@@ -209,8 +210,8 @@ end
     prefetcht0(ptrĈ + 5sc2)
     # rank-1 updates
     for _ in 1:punroll
-        prefetcht0(ptrÂ + 8 * st * micro_m)
-        @nexprs 8 u -> begin
+        @nexprs 16 u -> begin
+            u % 2 == 0 && prefetcht0(ptrÂ + (unroll + u) * st * micro_m)
             # iteration u
             Â1 = vload(V, ptrÂ + (u - 1) * st * micro_m)
             Â2 = vload(V, ptrÂ + (u - 1) * st * micro_m + sv)
@@ -234,8 +235,8 @@ end
             Ĉ16 = fma(Â1, B6, Ĉ16)
             Ĉ26 = fma(Â2, B6, Ĉ26)
         end
-        ptrÂ += 8 * st * micro_m
-        ptrB̂ += 8 * st * micro_n
+        ptrÂ += unroll * st * micro_m
+        ptrB̂ += unroll * st * micro_n
     end
 
     for _ in 1:pleft
