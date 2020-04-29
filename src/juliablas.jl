@@ -71,9 +71,11 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
                             packing_microkernel!(C, Abuffer, Bbuffer, α, _β, Coffset, Aoffset, Boffset, ps, kernel_params)
                         else
-                            # (mleft × ks) * (ks × nleft)
-                            # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-                            packing_microkernel!(ABbuffer, Abuffer, Bbuffer, α, _β, 0, Aoffset, Boffset, ps, kernel_params)
+                            # microkernel writes to the `AB` buffer
+                            packing_microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
+                            # copy the `AB` buffer to `C` with `β` scaling
+                            # Ĉ = AB[1:mleft-1, 1:nleft-1]
+                            cleanup_packing!(C, ABbuffer, β, Coffset, mleft, nleft)
                         end
                     end # microi
                 end # microj
@@ -417,16 +419,51 @@ end
 end
 #TODO: (A'B), AB', and A'B'
 
+###
+### Clean up loops
+###
+
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
 function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
-    iszeroβ = iszero(β)
-    @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-        ABîĵ = zero(eltype(C))
-        @simd ivdep for p̂ in p₁:p₂
-            ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+    if iszero(β)
+        @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+            ABîĵ = zero(eltype(C))
+            @simd ivdep for p̂ in p₁:p₂
+                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+            end
+            C[î, ĵ] = α * ABîĵ
         end
-        C[î, ĵ] = iszeroβ ? α * ABîĵ : muladd(α, ABîĵ, β * C[î, ĵ])
+    else
+        @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+            ABîĵ = zero(eltype(C))
+            @simd ivdep for p̂ in p₁:p₂
+                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+            end
+            C[î, ĵ] = muladd(α, ABîĵ, β * C[î, ĵ])
+        end
+    end
+    return nothing
+end
+
+# copy the `AB` buffer to `C` with `β` scaling
+# Ĉ = AB[1:mleft-1, 1:nleft-1]
+function cleanup_packing!(C, ABbuffer, β, Coffset, mleft, nleft)
+    if iszero(β)
+        for j in 1:mleft-1
+            @inbounds @simd ivdep for i in 1:nleft-1
+                idx = Coffset + (j - 1) * size(C, 2) + i
+                C[idx] = ABbuffer[i, j]
+            end
+        end
+    else
+        for j in 1:mleft-1
+            @inbounds @simd ivdep for i in 1:nleft-1
+                idx = Coffset + (j - 1) * size(C, 2) + i
+                Cij = C[idx]
+                C[idx] = muladd(β, Cij, ABbuffer[i, j])
+            end
+        end
     end
     return nothing
 end
