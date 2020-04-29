@@ -184,8 +184,8 @@ end
     sv = sizeof(V)
     sc2 = stride(C, 2)*st
     micro_m, micro_n = 8, 6
-    # we unroll 16 times
-    unroll = 16
+    # we unroll 4 times
+    unroll = 4
     punroll, pleft = divrem(ps, unroll)
 
     ptrĈ = pointer(C) + Coffset * st # pointer with offset
@@ -194,18 +194,19 @@ end
     ptrB̂ = pointer(Bbuffer) + Boffset * st
 
     # prefetch C matrix
-    prefetcht0(ptrĈ)
-    prefetcht0(ptrĈ +  sc2)
-    prefetcht0(ptrĈ + 2sc2)
-    prefetcht0(ptrĈ + 3sc2)
-    prefetcht0(ptrĈ + 4sc2)
-    prefetcht0(ptrĈ + 5sc2)
+    prefetcht0(ptrĈ + 7*8)
+    prefetcht0(ptrĈ +  sc2 + 7*8)
+    prefetcht0(ptrĈ + 2sc2 + 7*8)
+    prefetcht0(ptrĈ + 3sc2 + 7*8)
+    prefetcht0(ptrĈ + 4sc2 + 7*8)
+    prefetcht0(ptrĈ + 5sc2 + 7*8)
 
     # rank-1 updates
     Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
     for _ in 1:punroll
-        @nexprs 16 u -> begin
-            u % 2 == 0 && prefetcht0(ptrÂ + (unroll + u) * st * micro_m)
+        @nexprs 4 u -> begin
+            u == 1 && prefetcht0(ptrÂ + 64 * 8)
+            u == 3 && prefetcht0(ptrÂ + 76 * 8)
             # iteration u
             Â1 = vload(V, ptrÂ + (u - 1) * st * micro_m)
             Â2 = vload(V, ptrÂ + (u - 1) * st * micro_m + sv)
@@ -234,6 +235,7 @@ end
     end
 
     for _ in 1:pleft
+        prefetcht0(ptrÂ + 64 * 8)
         Â1 = vload(V, ptrÂ)
         Â2 = vload(V, ptrÂ + sv)
         B1 = V(unsafe_load(ptrB̂))
@@ -313,17 +315,18 @@ end
     ptrB̂ = getptr(B, p, j)
 
     # prefetch C matrix
-    prefetcht0(ptrĈ)
-    prefetcht0(ptrĈ +  sc2)
-    prefetcht0(ptrĈ + 2sc2)
-    prefetcht0(ptrĈ + 3sc2)
-    prefetcht0(ptrĈ + 4sc2)
-    prefetcht0(ptrĈ + 5sc2)
+    prefetcht0(ptrĈ + 7*8)
+    prefetcht0(ptrĈ +  sc2 + 7*8)
+    prefetcht0(ptrĈ + 2sc2 + 7*8)
+    prefetcht0(ptrĈ + 3sc2 + 7*8)
+    prefetcht0(ptrĈ + 4sc2 + 7*8)
+    prefetcht0(ptrĈ + 5sc2 + 7*8)
 
     # rank-1 updates
     Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
     for _ in 1:punroll
-        prefetcht0(ptrÂ + 8sa2)
+        # TODO
+        #prefetcht0(ptrÂ + 8sa2)
         @nexprs 8 u -> begin
             # iteration u
             Â1 = vload(V, ptrÂ + (u - 1) * sa2)
