@@ -189,7 +189,7 @@ end
     punroll, pleft = divrem(ps, unroll)
 
     ptrĈ = pointer(C) + Coffset * st # pointer with offset
-
+    ptrĈ3 = ptrĈ + 3sc2
     ptrÂ = pointer(Abuffer) + Aoffset * st
     ptrB̂ = pointer(Bbuffer) + Boffset * st
 
@@ -197,9 +197,9 @@ end
     prefetcht0(ptrĈ + 7*8)
     prefetcht0(ptrĈ +  sc2 + 7*8)
     prefetcht0(ptrĈ + 2sc2 + 7*8)
-    prefetcht0(ptrĈ + 3sc2 + 7*8)
-    prefetcht0(ptrĈ + 4sc2 + 7*8)
-    prefetcht0(ptrĈ + 5sc2 + 7*8)
+    prefetcht0(ptrĈ3)
+    prefetcht0(ptrĈ3 +  sc2 + 7*8)
+    prefetcht0(ptrĈ3 + 2sc2 + 7*8)
 
     # rank-1 updates
     Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
@@ -311,6 +311,7 @@ end
 
     p = p₁
     ptrĈ = getptr(C, i, j) # pointer with offset
+    ptrĈ3 = ptrĈ + 3sc2
     ptrÂ = getptr(A, i, p)
     ptrB̂ = getptr(B, p, j)
 
@@ -318,9 +319,9 @@ end
     prefetcht0(ptrĈ + 7*8)
     prefetcht0(ptrĈ +  sc2 + 7*8)
     prefetcht0(ptrĈ + 2sc2 + 7*8)
-    prefetcht0(ptrĈ + 3sc2 + 7*8)
-    prefetcht0(ptrĈ + 4sc2 + 7*8)
-    prefetcht0(ptrĈ + 5sc2 + 7*8)
+    prefetcht0(ptrĈ3)
+    prefetcht0(ptrĈ3 +  sc2 + 7*8)
+    prefetcht0(ptrĈ3 + 2sc2 + 7*8)
 
     # rank-1 updates
     Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
