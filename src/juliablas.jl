@@ -54,21 +54,21 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
         throw(ArgumentError("tiling_mul! doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
     m, k, n = checkmulsize(C, A, B)
-    for cachejstart in 1:cache_n:n; cachejend = min(cachejstart + cache_n - 1, n)
-        for cachepstart in 1:cache_k:k; cachepend = min(cachepstart + cache_k - 1, k)
-            _β = cachepstart == 1 ? β : one(β)
-            for cacheistart in 1:cache_m:m; cacheiend = min(cacheistart + cache_m - 1, m)
+    for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
+        for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
+            _β = cachep₁ == 1 ? β : one(β)
+            for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 # macrokernel
-                for microjstart in cachejstart:micro_n:cachejend; nleft = min(cachejend - microjstart + 1, micro_n)
-                    for microistart in cacheistart:micro_m:cacheiend; mleft = min(cacheiend - microistart + 1, micro_m)
+                for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
+                    for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            tiling_microkernel!(C, A, B, α, _β, microistart, microjstart, cachepstart, cachepend, kernel_params)
+                            tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, kernel_params)
                         else
                             # (mleft × ks) * (ks × nleft)
                             # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-                            cleanup_tiling_microkernel!(C, A, B, α, _β, microistart, microjstart, cachepstart, cachepend, mleft, nleft)
+                            cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
                         end
                     end # microi
                 end # microj
@@ -97,7 +97,7 @@ end
 # (micro_m × ks) * (ks × micro_n)
 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
 @noinline function tiling_microkernel!(C::StridedMatrix{Float64}, A::StridedMatrix{Float64}, B::StridedMatrix{Float64}, α, β,
-                                     i, j, pstart, pend, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+                                     i, j, p₁, p₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     T = Float64
     N = 4
     V = Vec{N, T}
@@ -107,7 +107,7 @@ end
     sb2 = stride(B, 2)*st
     sc2 = stride(C, 2)*st
     # we unroll 8 times
-    punroll, pleft = divrem(pend - pstart + 1, 8)
+    punroll, pleft = divrem(p₂ - p₁ + 1, 8)
 
     ptrĈ = getptr(C, i, j) # pointer with offset
     Ĉ11 = zero(V)
@@ -124,7 +124,7 @@ end
     Ĉ26 = zero(V)
 
     # rank-1 updates
-    p = pstart
+    p = p₁
     ptrÂ = getptr(A, i, p)
     ptrB̂ = getptr(B, p, j)
 
@@ -226,11 +226,11 @@ end
 
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, pstart, pend, mleft, nleft)
+function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
     iszeroβ = iszero(β)
     @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
         ABîĵ = zero(eltype(C))
-        @simd ivdep for p̂ in pstart:pend
+        @simd ivdep for p̂ in p₁:p₂
             ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
         end
         C[î, ĵ] = iszeroβ ? α * ABîĵ : muladd(α, ABîĵ, β * C[î, ĵ])
