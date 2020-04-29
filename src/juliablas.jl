@@ -82,12 +82,56 @@ end
 ### Packing
 ###
 
-function packAbuffer!
-
+function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, micro_m)
+    # terminology:
+    # a `micro_m × 1` vector is a panel
+    # a `micro_m × cache_k` matrix is a block
+    l = 0 # write position in packing buffer
+    for i₁ in cachei₁:micro_m:cachei₂ # iterate over blocks
+        i₂ = i₁ + micro_m - 1
+        if i₂ <= cachei₂ # full panel
+            # copy a panel to the buffer contiguously
+            for p in cachep₁:cachep₂, i in i₁:i₂
+                @inbounds Abuffer[l += 1] = A[i, p]
+            end
+        else # a panel is not full
+            for p in cachep₁:cachep₂ # iterate through panel columns
+                for i in i₁:cachei₂  # iterate through live panel rows
+                    @inbounds Abuffer[l += 1] = A[i, p]
+                end
+                for i in (i₂ + 1):i₂ # pad the rest of the panel with zero
+                    @inbounds Abuffer[l += 1] = zero(eltype(Abuffer))
+                end
+            end
+        end
+    end
+    return nothing
 end
 
-function packBbuffer!
-
+function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, micro_n)
+    # terminology:
+    # a `1 × micro_n` vector is a panel
+    # a `cache_k × micro_n` matrix is a block
+    l = 0 # write position in packing buffer
+    for j₁ in cachej₁:micro_n:cachej₂ # iterate over blocks
+        j₂ = j₁ + micro_n - 1
+        if j₂ <= cachej₂ # full panel
+            # copy a panel to the buffer contiguously
+            for p in cachep₁:cachep₂, j in j₁:j₂
+                @inbounds Bbuffer[l += 1] = B[p, j]
+            end
+        else # a panel is not full
+            for p in cachep₁:cachep₂ # iterate through panel columns
+                for j in j₁:cachej₂  # iterate through live panel rows
+                    @inbounds Bbuffer[l += 1] = B[i, p]
+                end
+                for j in (j₂ + 1):j₂ # pad the rest of the panel with zero
+                    @inbounds Bbuffer[l += 1] = zero(eltype(Bbuffer))
+                end
+            end
+        end
+    end
+    return nothing
 end
 
 ###
