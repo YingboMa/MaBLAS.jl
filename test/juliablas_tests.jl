@@ -15,8 +15,8 @@ end
     C = rand(m, n)
     A = rand(m, k)
     B = rand(k, n)
-    for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true)
-        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+    for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, false)
+        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
 end
 
