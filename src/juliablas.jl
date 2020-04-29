@@ -50,24 +50,29 @@ end
 function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     Abuffer = zeros(cache_m * cache_k)
     Bbuffer = zeros(cache_k * cache_n)
+    ABbuffer = zeros(micro_m, micro_n)
     m, k, n = checkmulsize(C, A, B)
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
             _β = cachep₁ == 1 ? β : one(β)
+            ps = cachep₂ - cachep₁ + 1
             packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, micro_n)
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, micro_m)
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
+                    Boffset = (microj₁ - cachej₁) * ps
                     for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
+                        Aoffset = (microi₁ - cachei₁) * ps
+                        Coffset = (microj₁ - 1) * stride(C, 2) + (microi₁ - 1) * stride(C, 1)
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            packing_microkernel!(C, Abuffer, Bbuffer, α, _β, microi₁, microj₁, cachei₁, cachej₁, cachep₁, cachep₂, kernel_params)
+                            packing_microkernel!(C, Abuffer, Bbuffer, α, _β, Coffset, Aoffset, Boffset, ps, kernel_params)
                         else
                             # (mleft × ks) * (ks × nleft)
                             # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-                            #cleanup_packing_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
+                            packing_microkernel!(ABbuffer, Abuffer, Bbuffer, α, _β, 0, Aoffset, Boffset, ps, kernel_params)
                         end
                     end # microi
                 end # microj
@@ -170,7 +175,7 @@ end
 ###
 
 @noinline function packing_microkernel!(C::StridedMatrix{Float64}, Abuffer::StridedVector{Float64}, Bbuffer::StridedVector{Float64}, α, β,
-                                        microi₁, microj₁, cachei₁, cachej₁, cachep₁, cachep₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+                                        Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     T = Float64
     N = 4
     V = Vec{N, T}
@@ -179,10 +184,9 @@ end
     sc2 = stride(C, 2)*st
     # we unroll 8 times
     unroll = 16
-    piters = cachep₂ - cachep₁ + 1
-    punroll, pleft = divrem(piters, unroll)
+    punroll, pleft = divrem(ps, unroll)
 
-    ptrĈ = getptr(C, microi₁, microj₁) # pointer with offset
+    ptrĈ = pointer(C) + Coffset * st # pointer with offset
     Ĉ11 = zero(V)
     Ĉ21 = zero(V)
     Ĉ12 = zero(V)
@@ -196,10 +200,8 @@ end
     Ĉ16 = zero(V)
     Ĉ26 = zero(V)
 
-    Aoffset = (microi₁ - cachei₁) * piters * st
-    Boffset = (microj₁ - cachej₁) * piters * st
-    ptrÂ = pointer(Abuffer) + Aoffset
-    ptrB̂ = pointer(Bbuffer) + Boffset
+    ptrÂ = pointer(Abuffer) + Aoffset * st
+    ptrB̂ = pointer(Bbuffer) + Boffset * st
 
     # prefetch C matrix
     prefetcht0(ptrĈ)
