@@ -46,8 +46,13 @@ function packing_mul!(C, A, B, α=true, β=false)
 
 end
 
-
 function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+    cs1 = stride(C, 1)
+    as1 = stride(A, 1)
+    bs1 = stride(B, 1)
+    if !(cs1 == as1 == bs1 == 1)
+        throw(ArgumentError("tiling_mul! doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1".))
+    end
     m, k, n = checkmulsize(C, A, B)
     # tiling
     for cachejstart in 1:cache_n:n
@@ -251,7 +256,7 @@ function checkmulsize(C, A, B)
     return cm, ak, bn
 end
 
-@inline getptr(A::StridedMatrix, i, j) = pointer(A, (j - 1) * stride(A, 2) + i)
+@inline getptr(A::StridedMatrix{T}, i, j) where T = pointer(A) + ((j - 1) * stride(A, 2) + i - 1) * sizeof(T)
 
 @inline function vecload(V::Type{Vec{N,T}}, A::StridedMatrix, ptr::Ptr{T}, i, j)::V where {N,T}
     ii = (j - 1) * stride(A, 2) + (i - 1) * N

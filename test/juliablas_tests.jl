@@ -34,9 +34,14 @@ end
 end
 
 @testset "View of matrix" begin
-    V = randn(10, 10)
-    A = @view V[1:5,  1:5]
-    B = @view V[6:10, 1:5]
-    C = @view V[1:5, 6:10]
+    V = randn(200, 200)
+    A = @view V[1:100,  1:100]
+    B = @view V[101:end, 1:100]
+    C = @view V[1:100, 101:end]
+    _m, _k, _n = 8*3, 8, 6*5
+    cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
     @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B)
+
+    A = @view V[1:2:100, 1:100]
+    @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B)
 end
