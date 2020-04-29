@@ -51,23 +51,17 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
     as1 = stride(A, 1)
     bs1 = stride(B, 1)
     if !(cs1 == as1 == bs1 == 1)
-        throw(ArgumentError("tiling_mul! doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1".))
+        throw(ArgumentError("tiling_mul! doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
     m, k, n = checkmulsize(C, A, B)
-    # tiling
-    for cachejstart in 1:cache_n:n
-        cachejend = min(cachejstart + cache_n - 1, n)
-        for cachepstart in 1:cache_k:k
-            cachepend = min(cachepstart + cache_k - 1, k)
+    for cachejstart in 1:cache_n:n; cachejend = min(cachejstart + cache_n - 1, n)
+        for cachepstart in 1:cache_k:k; cachepend = min(cachepstart + cache_k - 1, k)
             _β = cachepstart == 1 ? β : one(β)
-            for cacheistart in 1:cache_m:m
-                cacheiend = min(cacheistart + cache_m - 1, m)
+            for cacheistart in 1:cache_m:m; cacheiend = min(cacheistart + cache_m - 1, m)
                 # macrokernel
-                for microjstart in cachejstart:micro_n:cachejend
-                    nleft = min(cachejend - microjstart + 1, micro_n)
-                    for microistart in cacheistart:micro_m:cacheiend
-                        mleft = min(cacheiend - microistart + 1, micro_m)
-                        if nleft >= micro_n && mleft >= micro_m
+                for microjstart in cachejstart:micro_n:cachejend; nleft = min(cachejend - microjstart + 1, micro_n)
+                    for microistart in cacheistart:micro_m:cacheiend; mleft = min(cacheiend - microistart + 1, micro_m)
+                        if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
                             tiling_microkernel!(C, A, B, α, _β, microistart, microjstart, cachepstart, cachepend, kernel_params)
