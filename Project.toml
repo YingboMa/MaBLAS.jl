@@ -4,10 +4,8 @@ authors = ["Yingbo Ma <mayingbo5@gmail.com>"]
 version = "0.1.0"
 
 [deps]
-LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SIMDPirates = "21efa798-c60a-11e8-04d3-e1a92915a26a"
-StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
 SIMDPirates = "0.7"

@@ -2,7 +2,7 @@ using SIMDPirates
 using SIMDPirates: vfmadd231
 using LinearAlgebra: Transpose, Adjoint
 using Base.Cartesian: @nexprs
-using StaticArrays
+using ..LoopInfo
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -94,9 +94,9 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
             _β = cachep₁ == 1 ? β : one(β)
             ps = cachep₂ - cachep₁ + 1
-            packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, micro_n)
+            packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
-                packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, micro_m)
+                packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
                     Boffset = (microj₁ - cachej₁) * ps
@@ -158,7 +158,7 @@ end
 ### Packing
 ###
 
-function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, micro_m)
+function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, ::Val{micro_m}) where micro_m
     # terminology:
     # a `micro_m × 1` vector is a panel
     # a `micro_m × cache_k` matrix is a block
@@ -167,8 +167,8 @@ function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, mi
         i₂ = i₁ + micro_m - 1
         if i₂ <= cachei₂ # full panel
             # copy a panel to the buffer contiguously
-            for p in cachep₁:cachep₂
-                @simd for i in i₁:i₂
+            @simd for p in cachep₁:cachep₂
+                @unroll for i in i₁:i₂ # has constant loop count
                     Abuffer[l += 1] = constarray(A)[i, p]
                 end
             end
@@ -186,7 +186,7 @@ function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, mi
     return nothing
 end
 
-function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, micro_n)
+function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, ::Val{micro_n}) where micro_n
     # terminology:
     # a `1 × micro_n` vector is a panel
     # a `cache_k × micro_n` matrix is a block
@@ -195,8 +195,8 @@ function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, mi
         j₂ = j₁ + micro_n - 1
         if j₂ <= cachej₂ # full panel
             # copy a panel to the buffer contiguously
-            for p in cachep₁:cachep₂
-                @simd for j in j₁:j₂
+            @simd for p in cachep₁:cachep₂
+                @unroll for j in j₁:j₂ # has constant loop count
                     Bbuffer[l += 1] = constarray(B)[p, j]
                 end
             end
@@ -471,7 +471,7 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, n
     @inbounds @aliasscope if iszero(β)
         for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
-            @simd ivdep for p̂ in p₁:p₂
+            @simd for p̂ in p₁:p₂
                 ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
             end
             C[î, ĵ] = α * ABîĵ
@@ -479,7 +479,7 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, n
     else
         for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
-            @simd ivdep for p̂ in p₁:p₂
+            @simd for p̂ in p₁:p₂
                 ABîĵ = muladd(constarray(A[î, p̂]), constarray(B[p̂, ĵ]), ABîĵ)
             end
             Cîĵ = constarray(C[î, ĵ])
