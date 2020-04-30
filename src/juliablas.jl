@@ -20,6 +20,7 @@ using StaticArrays
 ###
 
 function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), packing=false)
+    cache_params=(cache_m=8, cache_k=2, cache_n=6)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
         return fill!(C, zero(eltype(C)))
@@ -65,17 +66,17 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
                     Boffset = (microj₁ - cachej₁) * ps
                     for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
                         Aoffset = (microi₁ - cachei₁) * ps
-                        Coffset = (microj₁ - 1) * stride(C, 2) + (microi₁ - 1) * stride(C, 1)
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
+                            Coffset = (microj₁ - 1) * stride(C, 2) + (microi₁ - 1) * stride(C, 1)
                             packing_microkernel!(C, Abuffer, Bbuffer, α, _β, Coffset, Aoffset, Boffset, ps, kernel_params)
                         else
                             # microkernel writes to the `AB` buffer
                             packing_microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
                             # copy the `AB` buffer to `C` with `β` scaling
-                            # Ĉ = AB[1:mleft-1, 1:nleft-1]
-                            cleanup_packing!(C, ABbuffer, β, Coffset, mleft, nleft)
+                            # Ĉ = AB[1:mleft, 1:nleft]
+                            cleanup_packing!(C, ABbuffer, _β, (microi₁ - 1, microj₁ - 1), mleft, nleft)
                         end
                     end # microi
                 end # microj
@@ -138,7 +139,7 @@ function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, mi
                 for i in i₁:cachei₂  # iterate through live panel rows
                     @inbounds Abuffer[l += 1] = A[i, p]
                 end
-                for i in (i₂ + 1):i₂ # pad the rest of the panel with zero
+                for i in (cachei₂ + 1):i₂ # pad the rest of the panel with zero
                     @inbounds Abuffer[l += 1] = zero(eltype(Abuffer))
                 end
             end
@@ -164,7 +165,7 @@ function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, mi
                 for j in j₁:cachej₂  # iterate through live panel rows
                     @inbounds Bbuffer[l += 1] = B[p, j]
                 end
-                for j in (j₂ + 1):j₂ # pad the rest of the panel with zero
+                for j in (cachej₂ + 1):j₂ # pad the rest of the panel with zero
                     @inbounds Bbuffer[l += 1] = zero(eltype(Bbuffer))
                 end
             end
@@ -447,21 +448,19 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, n
 end
 
 # copy the `AB` buffer to `C` with `β` scaling
-# Ĉ = AB[1:mleft-1, 1:nleft-1]
-function cleanup_packing!(C, ABbuffer, β, Coffset, mleft, nleft)
-    if iszero(β)
-        for j in 1:mleft-1
-            @inbounds @simd ivdep for i in 1:nleft-1
-                idx = Coffset + (j - 1) * size(C, 2) + i
-                C[idx] = ABbuffer[i, j]
+# Ĉ = AB[1:mleft, 1:nleft]
+function cleanup_packing!(C, ABbuffer, β, (ii, jj), mleft, nleft)
+    @inbounds if iszero(β)
+        for j in 1:nleft
+            @simd ivdep for i in 1:mleft
+                C[ii + i, jj + j] = ABbuffer[i, j]
             end
         end
     else
-        for j in 1:mleft-1
-            @inbounds @simd ivdep for i in 1:nleft-1
-                idx = Coffset + (j - 1) * size(C, 2) + i
-                Cij = C[idx]
-                C[idx] = muladd(β, Cij, ABbuffer[i, j])
+        for j in 1:nleft
+            @simd ivdep for i in 1:mleft
+                Cij = C[ii + i, jj + j]
+                C[ii + i, jj + j] = muladd(β, Cij, ABbuffer[i, j])
             end
         end
     end
