@@ -3,6 +3,7 @@ using SIMDPirates: vfmadd231
 using LinearAlgebra: Transpose, Adjoint
 using Base.Cartesian: @nexprs
 using ..LoopInfo
+using LoopVectorization: @avx
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -472,21 +473,21 @@ end
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
 function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
-    @inbounds @aliasscope if iszero(β)
-        for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+    if iszero(β)
+        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
-            @simd for p̂ in p₁:p₂
-                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
+            for p̂ in p₁:p₂
+                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
             end
             C[î, ĵ] = α * ABîĵ
         end
     else
-        for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
-            @simd for p̂ in p₁:p₂
-                ABîĵ = muladd(constarray(A[î, p̂]), constarray(B[p̂, ĵ]), ABîĵ)
+            for p̂ in p₁:p₂
+                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
             end
-            Cîĵ = constarray(C[î, ĵ])
+            Cîĵ = C[î, ĵ]
             C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
         end
     end
@@ -496,17 +497,17 @@ end
 # copy the `AB` buffer to `C` with `β` scaling
 # Ĉ = AB[1:mleft, 1:nleft]
 function cleanup_packing!(C, ABbuffer, β, (ii, jj), mleft, nleft)
-    @inbounds @aliasscope if iszero(β)
-        for j in 1:nleft
-            @simd for i in 1:mleft
-                C[ii + i, jj + j] = constarray(ABbuffer)[i, j]
+    if iszero(β)
+        @avx for j in 1:nleft
+            for i in 1:mleft
+                C[ii + i, jj + j] = ABbuffer[i, j]
             end
         end
     else
-        for j in 1:nleft
-            @simd for i in 1:mleft
-                Cij = constarray(C)[ii + i, jj + j]
-                C[ii + i, jj + j] = muladd(β, Cij, constarray(ABbuffer)[i, j])
+        @avx for j in 1:nleft
+            for i in 1:mleft
+                Cij = C[ii + i, jj + j]
+                C[ii + i, jj + j] = muladd(β, Cij, ABbuffer[i, j])
             end
         end
     end
