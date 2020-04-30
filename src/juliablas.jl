@@ -12,8 +12,9 @@ using StaticArrays
 # find a good direction/structure.
 
 ###
-### BLAS parameters and convenience aliases
+### BLAS parameters and buffers
 ###
+const BUFFER = UInt8[]
 
 ###
 ### User-level API
@@ -53,10 +54,17 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
     if cs1 != 1
         throw(ArgumentError("packing_mul! doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
     end
-    Abuffer = zeros(cache_m * cache_k)
-    Bbuffer = zeros(cache_k * cache_n)
-    ABbuffer = zeros(micro_m, micro_n)
     m, k, n = checkmulsize(C, A, B)
+    # get buffer
+    Abuffersize = cache_m * cache_k
+    Bbuffersize = cache_k * cache_n
+    ABbuffersize = micro_m * micro_n
+    T = eltype(C)
+    resize!(BUFFER, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T))
+    ptrbuffer = convert(Ptr{T}, pointer(BUFFER))
+    Abuffer = unsafe_wrap(Array, ptrbuffer, Abuffersize); ptrbuffer += Abuffersize * sizeof(T)
+    Bbuffer = unsafe_wrap(Array, ptrbuffer, Bbuffersize); ptrbuffer += Bbuffersize * sizeof(T)
+    ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
             _β = cachep₁ == 1 ? β : one(β)
