@@ -50,3 +50,11 @@ end
     C = @view V[1:2:end, 101:end]
     @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
 end
+
+@testset "Transposes/Adjoints" begin
+    m, k, n = 73, 131, 257 # all prime numbers
+    C = rand(m, n)
+    for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, ), A in (rand(m, k), rand(k, m)'), B in (rand(k, n), rand(n, k)')
+        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+    end
+end

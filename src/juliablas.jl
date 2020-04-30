@@ -12,15 +12,37 @@ using StaticArrays
 # find a good direction/structure.
 
 ###
-### BLAS parameters and buffers
+### Prelude
 ###
+
 const N_THREADS_BUFFERS = map(_->Vector{UInt8}(undef, 0), 1:Threads.nthreads())
+
+# alias scopes from https://github.com/JuliaLang/julia/pull/31018
+struct Const{T<:Array}
+    a::T
+end
+
+@eval Base.getindex(A::Const, i1::Int) = Core.const_arrayref($(Expr(:boundscheck)), A.a, i1)
+@eval Base.getindex(A::Const, i1::Int, i2::Int, I::Int...) = (Base.@_inline_meta; Core.const_arrayref($(Expr(:boundscheck)), A.a, i1, i2, I...))
+constarray(a::Array) = Const(a)
+constarray(a) = a
+
+macro aliasscope(body)
+    sym = gensym()
+    esc(quote
+        $(Expr(:aliasscope))
+        $sym = $body
+        $(Expr(:popaliasscope))
+        $sym
+    end)
+end
 
 ###
 ### User-level API
 ###
 
 function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), packing=false)
+    m, k, n = checkmulsize(C, A, B)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
         return fill!(C, zero(eltype(C)))
@@ -141,20 +163,22 @@ function packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, mi
     # a `micro_m × 1` vector is a panel
     # a `micro_m × cache_k` matrix is a block
     l = 0 # write position in packing buffer
-    for i₁ in cachei₁:micro_m:cachei₂ # iterate over blocks
+    @inbounds @aliasscope for i₁ in cachei₁:micro_m:cachei₂ # iterate over blocks
         i₂ = i₁ + micro_m - 1
         if i₂ <= cachei₂ # full panel
             # copy a panel to the buffer contiguously
-            for p in cachep₁:cachep₂, i in i₁:i₂
-                @inbounds Abuffer[l += 1] = A[i, p]
+            for p in cachep₁:cachep₂
+                @simd for i in i₁:i₂
+                    Abuffer[l += 1] = constarray(A)[i, p]
+                end
             end
         else # a panel is not full
             for p in cachep₁:cachep₂ # iterate through panel columns
                 for i in i₁:cachei₂  # iterate through live panel rows
-                    @inbounds Abuffer[l += 1] = A[i, p]
+                    Abuffer[l += 1] = constarray(A)[i, p]
                 end
                 for i in (cachei₂ + 1):i₂ # pad the rest of the panel with zero
-                    @inbounds Abuffer[l += 1] = zero(eltype(Abuffer))
+                    Abuffer[l += 1] = zero(eltype(Abuffer))
                 end
             end
         end
@@ -167,20 +191,22 @@ function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, mi
     # a `1 × micro_n` vector is a panel
     # a `cache_k × micro_n` matrix is a block
     l = 0 # write position in packing buffer
-    for j₁ in cachej₁:micro_n:cachej₂ # iterate over blocks
+    @inbounds @aliasscope for j₁ in cachej₁:micro_n:cachej₂ # iterate over blocks
         j₂ = j₁ + micro_n - 1
         if j₂ <= cachej₂ # full panel
             # copy a panel to the buffer contiguously
-            for p in cachep₁:cachep₂, j in j₁:j₂
-                @inbounds Bbuffer[l += 1] = B[p, j]
+            for p in cachep₁:cachep₂
+                @simd for j in j₁:j₂
+                    Bbuffer[l += 1] = constarray(B)[p, j]
+                end
             end
         else # a panel is not full
             for p in cachep₁:cachep₂ # iterate through panel columns
                 for j in j₁:cachej₂  # iterate through live panel rows
-                    @inbounds Bbuffer[l += 1] = B[p, j]
+                    Bbuffer[l += 1] = constarray(B)[p, j]
                 end
                 for j in (cachej₂ + 1):j₂ # pad the rest of the panel with zero
-                    @inbounds Bbuffer[l += 1] = zero(eltype(Bbuffer))
+                    Bbuffer[l += 1] = zero(eltype(Bbuffer))
                 end
             end
         end
@@ -324,7 +350,8 @@ end
     sc2 = stride(C, 2)*st
     micro_m, micro_n = 8, 6
     # we unroll 8 times
-    punroll, pleft = divrem(p₂ - p₁ + 1, 8)
+    unroll = 4
+    punroll, pleft = divrem(p₂ - p₁ + 1, unroll)
 
     p = p₁
     ptrĈ = getptr(C, i, j) # pointer with offset
@@ -345,7 +372,7 @@ end
     for _ in 1:punroll
         # TODO
         #prefetcht0(ptrÂ + 8sa2)
-        @nexprs 8 u -> begin
+        @nexprs 4 u -> begin
             # iteration u
             Â1 = vload(V, ptrÂ + (u - 1) * sa2)
             Â2 = vload(V, ptrÂ + (u - 1) * sa2 + sv)
@@ -369,9 +396,9 @@ end
             Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
             Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
         end
-        p += 8
-        ptrÂ += 8sa2
-        ptrB̂ += 8st # sb1
+        p += unroll
+        ptrÂ += unroll * sa2
+        ptrB̂ += unroll * st # sb1
     end
 
     for _ in 1:pleft
@@ -441,21 +468,22 @@ end
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
 function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
-    if iszero(β)
-        @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+    @inbounds @aliasscope if iszero(β)
+        for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
             @simd ivdep for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
             end
             C[î, ĵ] = α * ABîĵ
         end
     else
-        @inbounds for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+        for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
             @simd ivdep for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+                ABîĵ = muladd(constarray(A[î, p̂]), constarray(B[p̂, ĵ]), ABîĵ)
             end
-            C[î, ĵ] = muladd(α, ABîĵ, β * C[î, ĵ])
+            Cîĵ = constarray(C[î, ĵ])
+            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
         end
     end
     return nothing
@@ -464,17 +492,17 @@ end
 # copy the `AB` buffer to `C` with `β` scaling
 # Ĉ = AB[1:mleft, 1:nleft]
 function cleanup_packing!(C, ABbuffer, β, (ii, jj), mleft, nleft)
-    @inbounds if iszero(β)
+    @inbounds @aliasscope if iszero(β)
         for j in 1:nleft
-            @simd ivdep for i in 1:mleft
-                C[ii + i, jj + j] = ABbuffer[i, j]
+            @simd for i in 1:mleft
+                C[ii + i, jj + j] = constarray(ABbuffer)[i, j]
             end
         end
     else
         for j in 1:nleft
-            @simd ivdep for i in 1:mleft
-                Cij = C[ii + i, jj + j]
-                C[ii + i, jj + j] = muladd(β, Cij, ABbuffer[i, j])
+            @simd for i in 1:mleft
+                Cij = constarray(C)[ii + i, jj + j]
+                C[ii + i, jj + j] = muladd(β, Cij, constarray(ABbuffer)[i, j])
             end
         end
     end
