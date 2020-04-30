@@ -9,7 +9,7 @@ using LoopVectorization: @avx
 # also, don't strict type the container type
 
 # I'll try to implement everything without defining a type, and all variables
-# should stays local if possible. We can always clean up the code later when we
+# should stay local if possible. We can always clean up the code later when we
 # find a good direction/structure.
 
 ###
