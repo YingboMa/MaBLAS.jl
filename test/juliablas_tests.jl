@@ -40,8 +40,10 @@ end
     C = @view V[1:100, 101:end]
     _m, _k, _n = 8*3, 8, 6*5
     cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
-    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B)
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params)
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
 
     A = @view V[1:2:end, 1:100]
     @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B)
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
 end
