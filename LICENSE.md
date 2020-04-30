@@ -1,4 +1,4 @@
-SmallLinearAlgebra.jl is licensed under the MIT License:
+MaBLAS.jl is licensed under the MIT License:
 
 > Copyright (c) 2020: Yingbo Ma
 >

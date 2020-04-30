@@ -1,10 +1,10 @@
 using Test
-using SmallLinearAlgebra
+using MaBLAS
 using LinearAlgebra
 
 @testset "Size check" begin
     C = randn(12, 11); A = rand(2, 3); B = rand(2, 3)
-    @test_throws DimensionMismatch SmallLinearAlgebra.mul!(C, A, B)
+    @test_throws DimensionMismatch MaBLAS.mul!(C, A, B)
 end
 
 @testset "Kernel sized matmul" begin
@@ -16,7 +16,7 @@ end
     A = rand(m, k)
     B = rand(k, n)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, false)
-        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
 end
 
@@ -29,7 +29,7 @@ end
     A = rand(m, k)
     B = rand(k, n)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, false)
-        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
 end
 
@@ -40,21 +40,21 @@ end
     C = @view V[1:100, 101:end]
     _m, _k, _n = 8*3, 8, 6*5
     cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
-    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params)
-    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ MaBLAS.mul!(C, A, B; cache_params=cache_params)
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ MaBLAS.mul!(C, A, B; cache_params=cache_params, packing=true)
 
     A = @view V[1:2:end, 1:100]
-    @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B)
-    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
+    @test_throws ArgumentError MaBLAS.mul!(C, A, B)
+    @test LinearAlgebra.mul!((copy(C)), A, B) ≈ MaBLAS.mul!(C, A, B; cache_params=cache_params, packing=true)
 
     C = @view V[1:2:end, 101:end]
-    @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
+    @test_throws ArgumentError MaBLAS.mul!(C, A, B; cache_params=cache_params, packing=true)
 end
 
 @testset "Transposes/Adjoints" begin
     m, k, n = 73, 131, 257 # all prime numbers
     C = rand(m, n)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, ), A in (rand(m, k), rand(k, m)'), B in (rand(k, n), rand(n, k)')
-        @test SmallLinearAlgebra.mul!((copy(C)), A, B, α, β; packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        @test MaBLAS.mul!((copy(C)), A, B, α, β; packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
 end

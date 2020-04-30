@@ -1,5 +1,5 @@
-name = "SmallLinearAlgebra"
-uuid = "42749426-4a14-4e48-b862-652cce965524"
+name = "MaBLAS"
+uuid = "ff1443b0-0b7b-4ff9-a09e-db965c574e00"
 authors = ["Yingbo Ma <mayingbo5@gmail.com>"]
 version = "0.1.0"
 
