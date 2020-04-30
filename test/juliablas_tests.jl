@@ -46,4 +46,7 @@ end
     A = @view V[1:2:end, 1:100]
     @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B)
     @test LinearAlgebra.mul!((copy(C)), A, B) ≈ SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
+
+    C = @view V[1:2:end, 101:end]
+    @test_throws ArgumentError SmallLinearAlgebra.mul!(C, A, B; cache_params=cache_params, packing=true)
 end

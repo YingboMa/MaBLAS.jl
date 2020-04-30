@@ -20,7 +20,6 @@ using StaticArrays
 ###
 
 function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), packing=false)
-    cache_params=(cache_m=8, cache_k=2, cache_n=6)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
         return fill!(C, zero(eltype(C)))
@@ -50,6 +49,10 @@ end
 ###
 
 function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+    cs1 = stride(C, 1)
+    if cs1 != 1
+        throw(ArgumentError("packing_mul! doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
+    end
     Abuffer = zeros(cache_m * cache_k)
     Bbuffer = zeros(cache_k * cache_n)
     ABbuffer = zeros(micro_m, micro_n)
