@@ -227,7 +227,6 @@ end
     sv = sizeof(V)
     sc2 = stride(C, 2)*st
     micro_m, micro_n = 8, 6
-    # we unroll 4 times
     unroll = 4
     punroll, pleft = divrem(ps, unroll)
 
@@ -235,6 +234,9 @@ end
     ptrĈ3 = ptrĈ + 3sc2
     ptrÂ = pointer(Abuffer) + Aoffset * st
     ptrB̂ = pointer(Bbuffer) + Boffset * st
+    # preload A
+    Â1 = vload(V, ptrÂ)
+    Â2 = vload(V, ptrÂ + sv)
 
     # prefetch C matrix
     prefetcht0(ptrĈ + 7*8)
@@ -248,11 +250,9 @@ end
     Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
     for _ in 1:punroll
         @nexprs 4 u -> begin
-            u == 1 && prefetcht0(ptrÂ + 64 * 8)
-            u == 3 && prefetcht0(ptrÂ + 76 * 8)
-            # iteration u
-            Â1 = vload(V, ptrÂ + (u - 1) * st * micro_m)
-            Â2 = vload(V, ptrÂ + (u - 1) * st * micro_m + sv)
+            u == 1 && prefetcht0(ptrÂ + 64 * 8 + 2 * micro_n)
+            u == 3 && prefetcht0(ptrÂ + 76 * 8 + 2 * micro_n)
+            ## iteration u
             #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
             B1 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 0))
             Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
@@ -272,15 +272,15 @@ end
             B6 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 5st))
             Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
             Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
+            Â1 = vload(V, ptrÂ + u * st * micro_m)
+            Â2 = vload(V, ptrÂ + u * st * micro_m + sv)
         end
         ptrÂ += unroll * st * micro_m
         ptrB̂ += unroll * st * micro_n
     end
 
     for _ in 1:pleft
-        prefetcht0(ptrÂ + 64 * 8)
-        Â1 = vload(V, ptrÂ)
-        Â2 = vload(V, ptrÂ + sv)
+        prefetcht0(ptrÂ + 64 * 8 + 2 * micro_n)
         B1 = V(unsafe_load(ptrB̂))
         Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
         Ĉ21 = vfmadd231(Â2, B1, Ĉ21)
@@ -301,6 +301,8 @@ end
         Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
         ptrÂ += st * micro_m
         ptrB̂ += st * micro_n
+        Â1 = vload(V, ptrÂ)
+        Â2 = vload(V, ptrÂ + sv)
     end
 
     _α = V(α)
@@ -349,7 +351,6 @@ end
     sb2 = stride(B, 2)*st
     sc2 = stride(C, 2)*st
     micro_m, micro_n = 8, 6
-    # we unroll 8 times
     unroll = 4
     punroll, pleft = divrem(p₂ - p₁ + 1, unroll)
 
@@ -358,6 +359,9 @@ end
     ptrĈ3 = ptrĈ + 3sc2
     ptrÂ = getptr(A, i, p)
     ptrB̂ = getptr(B, p, j)
+    # preload A
+    Â1 = vload(V, ptrÂ)
+    Â2 = vload(V, ptrÂ + sv)
 
     # prefetch C matrix
     prefetcht0(ptrĈ + 7*8)
@@ -374,8 +378,6 @@ end
         #prefetcht0(ptrÂ + 8sa2)
         @nexprs 4 u -> begin
             # iteration u
-            Â1 = vload(V, ptrÂ + (u - 1) * sa2)
-            Â2 = vload(V, ptrÂ + (u - 1) * sa2 + sv)
             #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
             B1 = V(unsafe_load(ptrB̂ + (u - 1) * st))
             Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
@@ -395,6 +397,8 @@ end
             B6 = V(unsafe_load(ptrB̂ + (u - 1) * st + 5sb2))
             Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
             Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
+            Â1 = vload(V, ptrÂ + u * sa2)
+            Â2 = vload(V, ptrÂ + u * sa2 + sv)
         end
         p += unroll
         ptrÂ += unroll * sa2
@@ -402,8 +406,6 @@ end
     end
 
     for _ in 1:pleft
-        Â1 = vload(V, ptrÂ)
-        Â2 = vload(V, ptrÂ + sv)
         B1 = V(unsafe_load(ptrB̂))
         Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
         Ĉ21 = vfmadd231(Â2, B1, Ĉ21)
@@ -425,6 +427,8 @@ end
         p += 1
         ptrÂ += sa2
         ptrB̂ += st # sb1
+        Â1 = vload(V, ptrÂ)
+        Â2 = vload(V, ptrÂ + sv)
     end
 
     _α = V(α)
