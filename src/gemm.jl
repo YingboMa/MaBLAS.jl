@@ -44,7 +44,7 @@ end
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), packing=false)
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=false)
     m, k, n = checkmulsize(C, A, B)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
@@ -61,7 +61,6 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
         return C
     end
     # assume Float64 for now
-    kernel_params = (Val(8), Val(6))
     if packing
         packing_mul!(C, A, B, α, β, cache_params, kernel_params)
     else
@@ -221,76 +220,80 @@ end
 ### Micro kernel
 ###
 
-@noinline function packing_microkernel!(C::StridedMatrix{T}, Abuffer::StridedVector{T}, Bbuffer::StridedVector{T}, α, β,
+@generated function packing_microkernel!(C::StridedMatrix{T}, Abuffer::StridedVector{T}, Bbuffer::StridedVector{T}, α, β,
                                         Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(T)
     V = SVec{N,T}
     MM = _MM{N}
     unroll = 4
-    punroll, pleft = divrem(ps, unroll)
+    m2 = micro_m ÷ N
 
-    ptrĈ = stridedpointer(C, Coffset + 1) # pointer with offset
-    ptrÂ = stridedpointer(Abuffer, Aoffset + 1)
-    ptrB̂ = stridedpointer(Bbuffer, Boffset + 1)
+    quote
+        punroll, pleft = divrem(ps, $unroll)
 
-    # prefetch C matrix
-    # TODO
-    @nexprs 6 n̂ -> begin
-        prefetcht0(ptrĈ + offset(ptrĈ, (0, n̂ - 1)) + 7*2)
-    end
+        ptrĈ = stridedpointer(C, Coffset + 1) # pointer with offset
+        ptrÂ = stridedpointer(Abuffer, Aoffset + 1)
+        ptrB̂ = stridedpointer(Bbuffer, Boffset + 1)
 
-    # rank-1 updates
-    @nexprs 6 n̂ -> @nexprs 2 m̂ -> AB_m̂_n̂ = zero(V)
-    for _ in 1:punroll
-        @nexprs 4 u -> begin
+        # prefetch C matrix
+        # TODO
+        @nexprs $micro_n n̂ -> begin
+            prefetcht0(ptrĈ + offset(ptrĈ, (0, n̂ - 1)) + 7*2)
+        end
+
+        # rank-1 updates
+        @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
+        for _ in 1:punroll
+            @nexprs $unroll u -> begin
+                #TODO
+                u == 1 && prefetcht0(pointer(ptrÂ) + 64 * $micro_m + 2 * $micro_n)
+                u == 3 && prefetcht0(pointer(ptrÂ) + 76 * $micro_m + 2 * $micro_n)
+                ## iteration u
+                @nexprs $m2 m̂ -> A_m̂ = vload($V, ptrÂ + (u - 1) * $micro_m + (m̂ - 1) * $N)
+                #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
+                @nexprs $micro_n n̂ -> begin
+                    B_n̂ = $V(ptrB̂[n̂ + (u - 1) * $micro_n])
+                    @nexprs $m2 m̂ -> begin
+                        AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+                    end
+                end
+            end
+            ptrÂ += $(unroll * micro_m)
+            ptrB̂ += $(unroll * micro_n)
+        end
+
+        for _ in 1:pleft
             #TODO
-            u == 1 && prefetcht0(pointer(ptrÂ) + 64 * 8 + 2 * micro_n)
-            u == 3 && prefetcht0(pointer(ptrÂ) + 76 * 8 + 2 * micro_n)
-            ## iteration u
-            @nexprs 2 m̂ -> A_m̂ = vload(V, ptrÂ + (u - 1) * micro_m + (m̂ - 1) * N)
+            prefetcht0(pointer(ptrÂ) + 64 * $micro_m + 2 * $micro_n)
+            @nexprs $m2 m̂ -> A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N)
             #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
-            @nexprs 6 n̂ -> begin
-                B_n̂ = V(ptrB̂[n̂ + (u - 1) * micro_n])
-                @nexprs 2 m̂ -> begin
+            @nexprs $micro_n n̂ -> begin
+                B_n̂ = $V(ptrB̂[n̂])
+                @nexprs $m2 m̂ -> begin
                     AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
+            ptrÂ += $micro_m
+            ptrB̂ += $micro_n
         end
-        ptrÂ += unroll * micro_m
-        ptrB̂ += unroll * micro_n
-    end
 
-    for _ in 1:pleft
-        #TODO
-        prefetcht0(pointer(ptrÂ) + 64 * 8 + 2 * micro_n)
-        @nexprs 2 m̂ -> A_m̂ = vload(V, ptrÂ + (m̂ - 1) * N)
-        #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
-        @nexprs 6 n̂ -> begin
-            B_n̂ = V(ptrB̂[n̂])
-            @nexprs 2 m̂ -> begin
-                AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+        _α = $V(α)
+        if iszero(β)
+            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
+                C_m̂_n̂ = _α * AB_m̂_n̂
+                vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * $N + 1, n̂))
+            end
+        else
+            _β = $V(β)
+            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
+                C_m̂_n̂ = _β * vload(ptrĈ, ($MM((m̂ - 1) * $N + 1), n̂))
+                C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
+                vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * $N + 1, n̂))
             end
         end
-        ptrÂ += micro_m
-        ptrB̂ += micro_n
-    end
 
-    _α = V(α)
-    if iszero(β)
-        @nexprs 6 n̂ -> @nexprs 2 m̂ -> begin
-            C_m̂_n̂ = _α * AB_m̂_n̂
-            vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * N + 1, n̂))
-        end
-    else
-        _β = V(β)
-        @nexprs 6 n̂ -> @nexprs 2 m̂ -> begin
-            C_m̂_n̂ = _β * vload(ptrĈ, (MM((m̂ - 1) * N + 1), n̂))
-            C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
-            vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * N + 1, n̂))
-        end
+        return nothing
     end
-
-    return nothing
 end
 
 # (micro_m × ks) * (ks × micro_n)
