@@ -497,35 +497,4 @@ end
 end
 
 prefetcht0(ptr::AbstractPointer) = prefetcht0(pointer(ptr))
-prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
-# From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
-@generated function __prefetch(ptr::T, ::Val{RW}, ::Val{Locality}, ::Val{Cache}) where {T, RW, Locality, Cache}
-    decls = """
-    declare void @llvm.prefetch(i8*, i32, i32, i32)
-    """
-
-    if RW == :read
-        f_rw = 0
-    elseif RW == :write
-        f_rw = 1
-    end
-
-    f_locality = Locality
-
-    if Cache == :data
-        f_cache = 1
-    elseif Cache == :instruction
-        f_cache = 0
-    end
-
-    ir = """
-        %ptr = inttoptr i64 %0 to i8*
-        call void @llvm.prefetch(i8* %ptr, i32 $f_rw, i32 $f_locality, i32 $f_cache)
-        ret void
-    """
-
-    quote
-        Base.@_inline_meta
-        Base.llvmcall(($decls, $ir), Nothing, Tuple{T}, ptr)
-    end
-end
+prefetcht0(ptr::Ptr) = SIMDPirates.prefetch(ptr, Val(3), Val(0))
