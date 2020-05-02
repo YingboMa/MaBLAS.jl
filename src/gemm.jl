@@ -4,6 +4,8 @@ using LinearAlgebra: Transpose, Adjoint
 using Base.Cartesian: @nexprs
 using ..LoopInfo
 using LoopVectorization: @avx
+using VectorizationBase
+using VectorizationBase: offset, AbstractPointer
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -219,121 +221,73 @@ end
 ### Micro kernel
 ###
 
-@noinline function packing_microkernel!(C::StridedMatrix{Float64}, Abuffer::StridedVector{Float64}, Bbuffer::StridedVector{Float64}, α, β,
-                                        Coffset, Aoffset, Boffset, ps, ::Tuple{Val{8},Val{6}})
-    T = Float64
-    N = 4
-    V = SVec{N, T}
-    st = sizeof(T)
-    sv = sizeof(V)
-    sc2 = stride(C, 2)*st
-    micro_m, micro_n = 8, 6
+@noinline function packing_microkernel!(C::StridedMatrix{T}, Abuffer::StridedVector{T}, Bbuffer::StridedVector{T}, α, β,
+                                        Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+    N = VectorizationBase.pick_vector_width(T)
+    V = SVec{N,T}
+    MM = _MM{N}
     unroll = 4
     punroll, pleft = divrem(ps, unroll)
 
-    ptrĈ = pointer(C) + Coffset * st # pointer with offset
-    ptrĈ3 = ptrĈ + 3sc2
-    ptrÂ = pointer(Abuffer) + Aoffset * st
-    ptrB̂ = pointer(Bbuffer) + Boffset * st
-    # preload A
-    Â1 = vload(V, ptrÂ)
-    Â2 = vload(V, ptrÂ + sv)
+    ptrĈ = stridedpointer(C, Coffset + 1) # pointer with offset
+    ptrÂ = stridedpointer(Abuffer, Aoffset + 1)
+    ptrB̂ = stridedpointer(Bbuffer, Boffset + 1)
 
     # prefetch C matrix
-    prefetcht0(ptrĈ + 7*8)
-    prefetcht0(ptrĈ +  sc2 + 7*8)
-    prefetcht0(ptrĈ + 2sc2 + 7*8)
-    prefetcht0(ptrĈ3)
-    prefetcht0(ptrĈ3 +  sc2 + 7*8)
-    prefetcht0(ptrĈ3 + 2sc2 + 7*8)
+    # TODO
+    @nexprs 6 n̂ -> begin
+        prefetcht0(ptrĈ + offset(ptrĈ, (0, n̂ - 1)) + 7*2)
+    end
 
     # rank-1 updates
-    Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
+    @nexprs 6 n̂ -> @nexprs 2 m̂ -> AB_m̂_n̂ = zero(V)
     for _ in 1:punroll
         @nexprs 4 u -> begin
-            u == 1 && prefetcht0(ptrÂ + 64 * 8 + 2 * micro_n)
-            u == 3 && prefetcht0(ptrÂ + 76 * 8 + 2 * micro_n)
+            #TODO
+            u == 1 && prefetcht0(pointer(ptrÂ) + 64 * 8 + 2 * micro_n)
+            u == 3 && prefetcht0(pointer(ptrÂ) + 76 * 8 + 2 * micro_n)
             ## iteration u
+            @nexprs 2 m̂ -> A_m̂ = vload(V, ptrÂ + (u - 1) * micro_m + (m̂ - 1) * N)
             #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
-            B1 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 0))
-            Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
-            Ĉ21 = vfmadd231(Â2, B1, Ĉ21)
-            B2 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + st))
-            Ĉ12 = vfmadd231(Â1, B2, Ĉ12)
-            Ĉ22 = vfmadd231(Â2, B2, Ĉ22)
-            B3 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 2st))
-            Ĉ13 = vfmadd231(Â1, B3, Ĉ13)
-            Ĉ23 = vfmadd231(Â2, B3, Ĉ23)
-            B4 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 3st))
-            Ĉ14 = vfmadd231(Â1, B4, Ĉ14)
-            Ĉ24 = vfmadd231(Â2, B4, Ĉ24)
-            B5 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 4st))
-            Ĉ15 = vfmadd231(Â1, B5, Ĉ15)
-            Ĉ25 = vfmadd231(Â2, B5, Ĉ25)
-            B6 = V(unsafe_load(ptrB̂ + (u - 1) * st * micro_n + 5st))
-            Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
-            Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
-            Â1 = vload(V, ptrÂ + u * st * micro_m)
-            Â2 = vload(V, ptrÂ + u * st * micro_m + sv)
+            @nexprs 6 n̂ -> begin
+                B_n̂ = V(ptrB̂[n̂ + (u - 1) * micro_n])
+                @nexprs 2 m̂ -> begin
+                    AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+                end
+            end
         end
-        ptrÂ += unroll * st * micro_m
-        ptrB̂ += unroll * st * micro_n
+        ptrÂ += unroll * micro_m
+        ptrB̂ += unroll * micro_n
     end
 
     for _ in 1:pleft
-        prefetcht0(ptrÂ + 64 * 8 + 2 * micro_n)
-        B1 = V(unsafe_load(ptrB̂))
-        Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
-        Ĉ21 = vfmadd231(Â2, B1, Ĉ21)
-        B2 = V(unsafe_load(ptrB̂ + st))
-        Ĉ12 = vfmadd231(Â1, B2, Ĉ12)
-        Ĉ22 = vfmadd231(Â2, B2, Ĉ22)
-        B3 = V(unsafe_load(ptrB̂ + 2st))
-        Ĉ13 = vfmadd231(Â1, B3, Ĉ13)
-        Ĉ23 = vfmadd231(Â2, B3, Ĉ23)
-        B4 = V(unsafe_load(ptrB̂ + 3st))
-        Ĉ14 = vfmadd231(Â1, B4, Ĉ14)
-        Ĉ24 = vfmadd231(Â2, B4, Ĉ24)
-        B5 = V(unsafe_load(ptrB̂ + 4st))
-        Ĉ15 = vfmadd231(Â1, B5, Ĉ15)
-        Ĉ25 = vfmadd231(Â2, B5, Ĉ25)
-        B6 = V(unsafe_load(ptrB̂ + 5st))
-        Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
-        Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
-        ptrÂ += st * micro_m
-        ptrB̂ += st * micro_n
-        Â1 = vload(V, ptrÂ)
-        Â2 = vload(V, ptrÂ + sv)
+        #TODO
+        prefetcht0(pointer(ptrÂ) + 64 * 8 + 2 * micro_n)
+        @nexprs 2 m̂ -> A_m̂ = vload(V, ptrÂ + (m̂ - 1) * N)
+        #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
+        @nexprs 6 n̂ -> begin
+            B_n̂ = V(ptrB̂[n̂])
+            @nexprs 2 m̂ -> begin
+                AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+            end
+        end
+        ptrÂ += micro_m
+        ptrB̂ += micro_n
     end
 
     _α = V(α)
     if iszero(β)
-        vecstore!(_α * Ĉ11, C, ptrĈ, 1, 1)
-        vecstore!(_α * Ĉ21, C, ptrĈ, 2, 1)
-        vecstore!(_α * Ĉ12, C, ptrĈ, 1, 2)
-        vecstore!(_α * Ĉ22, C, ptrĈ, 2, 2)
-        vecstore!(_α * Ĉ13, C, ptrĈ, 1, 3)
-        vecstore!(_α * Ĉ23, C, ptrĈ, 2, 3)
-        vecstore!(_α * Ĉ14, C, ptrĈ, 1, 4)
-        vecstore!(_α * Ĉ24, C, ptrĈ, 2, 4)
-        vecstore!(_α * Ĉ15, C, ptrĈ, 1, 5)
-        vecstore!(_α * Ĉ25, C, ptrĈ, 2, 5)
-        vecstore!(_α * Ĉ16, C, ptrĈ, 1, 6)
-        vecstore!(_α * Ĉ26, C, ptrĈ, 2, 6)
+        @nexprs 6 n̂ -> @nexprs 2 m̂ -> begin
+            C_m̂_n̂ = _α * AB_m̂_n̂
+            vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * N + 1, n̂))
+        end
     else
         _β = V(β)
-        vecstore!(fma(_α, Ĉ11, _β * vecload(V, C, ptrĈ, 1, 1)), C, ptrĈ, 1, 1)
-        vecstore!(fma(_α, Ĉ21, _β * vecload(V, C, ptrĈ, 2, 1)), C, ptrĈ, 2, 1)
-        vecstore!(fma(_α, Ĉ12, _β * vecload(V, C, ptrĈ, 1, 2)), C, ptrĈ, 1, 2)
-        vecstore!(fma(_α, Ĉ22, _β * vecload(V, C, ptrĈ, 2, 2)), C, ptrĈ, 2, 2)
-        vecstore!(fma(_α, Ĉ13, _β * vecload(V, C, ptrĈ, 1, 3)), C, ptrĈ, 1, 3)
-        vecstore!(fma(_α, Ĉ23, _β * vecload(V, C, ptrĈ, 2, 3)), C, ptrĈ, 2, 3)
-        vecstore!(fma(_α, Ĉ14, _β * vecload(V, C, ptrĈ, 1, 4)), C, ptrĈ, 1, 4)
-        vecstore!(fma(_α, Ĉ24, _β * vecload(V, C, ptrĈ, 2, 4)), C, ptrĈ, 2, 4)
-        vecstore!(fma(_α, Ĉ15, _β * vecload(V, C, ptrĈ, 1, 5)), C, ptrĈ, 1, 5)
-        vecstore!(fma(_α, Ĉ25, _β * vecload(V, C, ptrĈ, 2, 5)), C, ptrĈ, 2, 5)
-        vecstore!(fma(_α, Ĉ16, _β * vecload(V, C, ptrĈ, 1, 6)), C, ptrĈ, 1, 6)
-        vecstore!(fma(_α, Ĉ26, _β * vecload(V, C, ptrĈ, 2, 6)), C, ptrĈ, 2, 6)
+        @nexprs 6 n̂ -> @nexprs 2 m̂ -> begin
+            C_m̂_n̂ = _β * vload(ptrĈ, (MM((m̂ - 1) * N + 1), n̂))
+            C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
+            vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * N + 1, n̂))
+        end
     end
 
     return nothing
@@ -539,6 +493,7 @@ end
     return vload(V, ptr + ii*sizeof(T))
 end
 
+prefetcht0(ptr::AbstractPointer) = prefetcht0(pointer(ptr))
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
 @generated function __prefetch(ptr::T, ::Val{RW}, ::Val{Locality}, ::Val{Cache}) where {T, RW, Locality, Cache}
