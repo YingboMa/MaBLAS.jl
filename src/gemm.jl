@@ -5,7 +5,7 @@ using Base.Cartesian: @nexprs
 using ..LoopInfo
 using LoopVectorization: @avx
 using VectorizationBase
-using VectorizationBase: offset, AbstractPointer
+using VectorizationBase: offset, AbstractPointer, align
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -19,6 +19,7 @@ using VectorizationBase: offset, AbstractPointer
 ###
 
 const N_THREADS_BUFFERS = map(_->Vector{UInt8}(undef, 0), 1:Threads.nthreads())
+const PAGE_SIZE = ccall(:jl_getpagesize, Int, ())
 
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
@@ -86,10 +87,10 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
     ABbuffersize = micro_m * micro_n
     T = eltype(C)
     buffer = N_THREADS_BUFFERS[Threads.threadid()]
-    resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T))
-    ptrbuffer = convert(Ptr{T}, pointer(buffer))
-    Abuffer = unsafe_wrap(Array, ptrbuffer, Abuffersize); ptrbuffer += Abuffersize * sizeof(T)
-    Bbuffer = unsafe_wrap(Array, ptrbuffer, Bbuffersize); ptrbuffer += Bbuffersize * sizeof(T)
+    resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
+    ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
+    Abuffer = unsafe_wrap(Array, ptrbuffer, Abuffersize); ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
+    Bbuffer = unsafe_wrap(Array, ptrbuffer, Bbuffersize); ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
     ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
