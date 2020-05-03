@@ -324,35 +324,36 @@ end
 
         # rank-1 updates
         @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
-        p = 1
         for _ in 1:punroll
             @nexprs $unroll u -> begin
                 @nexprs $m2 m̂ -> begin
                     vecidx = $MM((m̂ - 1) * $N + 1)
-                    A_m̂ = ptrÂ[vecidx, p + u - 1]
+                    A_m̂ = ptrÂ[vecidx, u]
                 end
                 @nexprs $micro_n n̂ -> begin
-                    B_n̂ = $V(ptrB̂[p + u - 1, n̂])
+                    B_n̂ = $V(ptrB̂[u, n̂])
                     @nexprs $m2 m̂ -> begin
                         AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                     end
                 end
             end
-            p += $unroll
+            ptrÂ += offset(ptrÂ, (0, unroll))
+            ptrB̂ += offset(ptrB̂, (unroll, 0))
         end
 
         for _ in 1:pleft
             @nexprs $m2 m̂ -> begin
                 vecidx = $MM((m̂ - 1) * $N + 1)
-                A_m̂ = ptrÂ[vecidx, p]
+                A_m̂ = ptrÂ[vecidx, u]
             end
             @nexprs $micro_n n̂ -> begin
-                B_n̂ = $V(ptrB̂[p, n̂])
+                B_n̂ = $V(ptrB̂[u, n̂])
                 @nexprs $m2 m̂ -> begin
                     AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
-            p += 1
+            ptrÂ += offset(ptrÂ, (0, 1))
+            ptrB̂ += offset(ptrB̂, (1, 0))
         end
 
         _α = $V(α)
