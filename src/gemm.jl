@@ -230,6 +230,7 @@ end
     m2 = micro_m ÷ N
 
     quote
+        $(Expr(:meta,:noinline))
         punroll, pleft = divrem(ps, $unroll)
 
         ptrĈ = stridedpointer(C, Coffset + 1) # pointer with offset
@@ -299,128 +300,78 @@ end
 
 # (micro_m × ks) * (ks × micro_n)
 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-@noinline function tiling_microkernel!(C::StridedMatrix{Float64}, A::StridedMatrix{Float64}, B::StridedMatrix{Float64}, α, β,
-                                       i, j, p₁, p₂, ::Tuple{Val{8},Val{6}})
-    T = Float64
-    N = 4
-    V = SVec{N, T}
-    st = sizeof(T)
-    sv = sizeof(V)
-    sa2 = stride(A, 2)*st
-    sb2 = stride(B, 2)*st
-    sc2 = stride(C, 2)*st
-    micro_m, micro_n = 8, 6
+@generated function tiling_microkernel!(C::StridedMatrix{T}, A::StridedMatrix{T}, B::StridedMatrix{T}, α, β,
+                                       i, j, p₁, p₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+    N = VectorizationBase.pick_vector_width(T)
+    V = SVec{N,T}
+    MM = _MM{N}
     unroll = 4
-    punroll, pleft = divrem(p₂ - p₁ + 1, unroll)
+    m2 = micro_m ÷ N
 
-    p = p₁
-    ptrĈ = getptr(C, i, j) # pointer with offset
-    ptrĈ3 = ptrĈ + 3sc2
-    ptrÂ = getptr(A, i, p)
-    ptrB̂ = getptr(B, p, j)
-    # preload A
-    Â1 = vload(V, ptrÂ)
-    Â2 = vload(V, ptrÂ + sv)
+    quote
+        $(Expr(:meta,:noinline))
+        punroll, pleft = divrem(p₂ - p₁ + 1, $unroll)
 
-    # prefetch C matrix
-    prefetcht0(ptrĈ + 7*8)
-    prefetcht0(ptrĈ +  sc2 + 7*8)
-    prefetcht0(ptrĈ + 2sc2 + 7*8)
-    prefetcht0(ptrĈ3)
-    prefetcht0(ptrĈ3 +  sc2 + 7*8)
-    prefetcht0(ptrĈ3 + 2sc2 + 7*8)
+        ptrĈ = stridedpointer(C, i, j)
+        ptrÂ = stridedpointer(A, i, p₁)
+        ptrB̂ = stridedpointer(B, p₁, j)
 
-    # rank-1 updates
-    Ĉ11 = Ĉ21 = Ĉ12 = Ĉ22 = Ĉ13 = Ĉ23 = Ĉ14 = Ĉ24 = Ĉ15 = Ĉ25 = Ĉ16 = Ĉ26 = zero(V)
-    for _ in 1:punroll
+        # prefetch C matrix
         # TODO
-        #prefetcht0(ptrÂ + 8sa2)
-        @nexprs 4 u -> begin
-            # iteration u
-            #B1..6 = V(@inbounds B[p + (u - 1), j + 0..5])
-            B1 = V(unsafe_load(ptrB̂ + (u - 1) * st))
-            Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
-            Ĉ21 = vfmadd231(Â2, B1, Ĉ21)
-            B2 = V(unsafe_load(ptrB̂ + (u - 1) * st + sb2))
-            Ĉ12 = vfmadd231(Â1, B2, Ĉ12)
-            Ĉ22 = vfmadd231(Â2, B2, Ĉ22)
-            B3 = V(unsafe_load(ptrB̂ + (u - 1) * st + 2sb2))
-            Ĉ13 = vfmadd231(Â1, B3, Ĉ13)
-            Ĉ23 = vfmadd231(Â2, B3, Ĉ23)
-            B4 = V(unsafe_load(ptrB̂ + (u - 1) * st + 3sb2))
-            Ĉ14 = vfmadd231(Â1, B4, Ĉ14)
-            Ĉ24 = vfmadd231(Â2, B4, Ĉ24)
-            B5 = V(unsafe_load(ptrB̂ + (u - 1) * st + 4sb2))
-            Ĉ15 = vfmadd231(Â1, B5, Ĉ15)
-            Ĉ25 = vfmadd231(Â2, B5, Ĉ25)
-            B6 = V(unsafe_load(ptrB̂ + (u - 1) * st + 5sb2))
-            Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
-            Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
-            Â1 = vload(V, ptrÂ + u * sa2)
-            Â2 = vload(V, ptrÂ + u * sa2 + sv)
+        @nexprs $micro_n n̂ -> begin
+            prefetcht0(ptrĈ + offset(ptrĈ, (0, n̂ - 1)) + 7*2)
         end
-        p += unroll
-        ptrÂ += unroll * sa2
-        ptrB̂ += unroll * st # sb1
-    end
 
-    for _ in 1:pleft
-        B1 = V(unsafe_load(ptrB̂))
-        Ĉ11 = vfmadd231(Â1, B1, Ĉ11)
-        Ĉ21 = vfmadd231(Â2, B1, Ĉ21)
-        B2 = V(unsafe_load(ptrB̂ + sb2))
-        Ĉ12 = vfmadd231(Â1, B2, Ĉ12)
-        Ĉ22 = vfmadd231(Â2, B2, Ĉ22)
-        B3 = V(unsafe_load(ptrB̂ + 2sb2))
-        Ĉ13 = vfmadd231(Â1, B3, Ĉ13)
-        Ĉ23 = vfmadd231(Â2, B3, Ĉ23)
-        B4 = V(unsafe_load(ptrB̂ + 3sb2))
-        Ĉ14 = vfmadd231(Â1, B4, Ĉ14)
-        Ĉ24 = vfmadd231(Â2, B4, Ĉ24)
-        B5 = V(unsafe_load(ptrB̂ + 4sb2))
-        Ĉ15 = vfmadd231(Â1, B5, Ĉ15)
-        Ĉ25 = vfmadd231(Â2, B5, Ĉ25)
-        B6 = V(unsafe_load(ptrB̂ + 5sb2))
-        Ĉ16 = vfmadd231(Â1, B6, Ĉ16)
-        Ĉ26 = vfmadd231(Â2, B6, Ĉ26)
-        p += 1
-        ptrÂ += sa2
-        ptrB̂ += st # sb1
-        Â1 = vload(V, ptrÂ)
-        Â2 = vload(V, ptrÂ + sv)
-    end
+        # rank-1 updates
+        @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
+        p = 1
+        for _ in 1:punroll
+            @nexprs $unroll u -> begin
+                @nexprs $m2 m̂ -> begin
+                    vecidx = $MM((m̂ - 1) * $N + 1)
+                    A_m̂ = ptrÂ[vecidx, p + u - 1]
+                end
+                @nexprs $micro_n n̂ -> begin
+                    B_n̂ = $V(ptrB̂[p + u - 1, n̂])
+                    @nexprs $m2 m̂ -> begin
+                        AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+                    end
+                end
+            end
+            p += $unroll
+        end
 
-    _α = V(α)
-    if iszero(β)
-        vecstore!(_α * Ĉ11, C, ptrĈ, 1, 1)
-        vecstore!(_α * Ĉ21, C, ptrĈ, 2, 1)
-        vecstore!(_α * Ĉ12, C, ptrĈ, 1, 2)
-        vecstore!(_α * Ĉ22, C, ptrĈ, 2, 2)
-        vecstore!(_α * Ĉ13, C, ptrĈ, 1, 3)
-        vecstore!(_α * Ĉ23, C, ptrĈ, 2, 3)
-        vecstore!(_α * Ĉ14, C, ptrĈ, 1, 4)
-        vecstore!(_α * Ĉ24, C, ptrĈ, 2, 4)
-        vecstore!(_α * Ĉ15, C, ptrĈ, 1, 5)
-        vecstore!(_α * Ĉ25, C, ptrĈ, 2, 5)
-        vecstore!(_α * Ĉ16, C, ptrĈ, 1, 6)
-        vecstore!(_α * Ĉ26, C, ptrĈ, 2, 6)
-    else
-        _β = V(β)
-        vecstore!(fma(_α, Ĉ11, _β * vecload(V, C, ptrĈ, 1, 1)), C, ptrĈ, 1, 1)
-        vecstore!(fma(_α, Ĉ21, _β * vecload(V, C, ptrĈ, 2, 1)), C, ptrĈ, 2, 1)
-        vecstore!(fma(_α, Ĉ12, _β * vecload(V, C, ptrĈ, 1, 2)), C, ptrĈ, 1, 2)
-        vecstore!(fma(_α, Ĉ22, _β * vecload(V, C, ptrĈ, 2, 2)), C, ptrĈ, 2, 2)
-        vecstore!(fma(_α, Ĉ13, _β * vecload(V, C, ptrĈ, 1, 3)), C, ptrĈ, 1, 3)
-        vecstore!(fma(_α, Ĉ23, _β * vecload(V, C, ptrĈ, 2, 3)), C, ptrĈ, 2, 3)
-        vecstore!(fma(_α, Ĉ14, _β * vecload(V, C, ptrĈ, 1, 4)), C, ptrĈ, 1, 4)
-        vecstore!(fma(_α, Ĉ24, _β * vecload(V, C, ptrĈ, 2, 4)), C, ptrĈ, 2, 4)
-        vecstore!(fma(_α, Ĉ15, _β * vecload(V, C, ptrĈ, 1, 5)), C, ptrĈ, 1, 5)
-        vecstore!(fma(_α, Ĉ25, _β * vecload(V, C, ptrĈ, 2, 5)), C, ptrĈ, 2, 5)
-        vecstore!(fma(_α, Ĉ16, _β * vecload(V, C, ptrĈ, 1, 6)), C, ptrĈ, 1, 6)
-        vecstore!(fma(_α, Ĉ26, _β * vecload(V, C, ptrĈ, 2, 6)), C, ptrĈ, 2, 6)
-    end
+        for _ in 1:pleft
+            @nexprs $m2 m̂ -> begin
+                vecidx = $MM((m̂ - 1) * $N + 1)
+                A_m̂ = ptrÂ[vecidx, p]
+            end
+            @nexprs $micro_n n̂ -> begin
+                B_n̂ = $V(ptrB̂[p, n̂])
+                @nexprs $m2 m̂ -> begin
+                    AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+                end
+            end
+            p += 1
+        end
 
-    return nothing
+        _α = $V(α)
+        if iszero(β)
+            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
+                C_m̂_n̂ = _α * AB_m̂_n̂
+                vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * $N + 1, n̂))
+            end
+        else
+            _β = $V(β)
+            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
+                C_m̂_n̂ = _β * vload(ptrĈ, ($MM((m̂ - 1) * $N + 1), n̂))
+                C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
+                vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * $N + 1, n̂))
+            end
+        end
+
+        return nothing
+    end
 end
 #TODO: (A'B), AB', and A'B'
 
