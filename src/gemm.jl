@@ -337,17 +337,17 @@ end
                     end
                 end
             end
-            ptrÂ += offset(ptrÂ, (0, unroll))
-            ptrB̂ += offset(ptrB̂, (unroll, 0))
+            ptrÂ += offset(ptrÂ, (0, $unroll))
+            ptrB̂ += offset(ptrB̂, ($unroll, 0))
         end
 
         for _ in 1:pleft
             @nexprs $m2 m̂ -> begin
                 vecidx = $MM((m̂ - 1) * $N + 1)
-                A_m̂ = ptrÂ[vecidx, u]
+                A_m̂ = ptrÂ[vecidx, 1]
             end
             @nexprs $micro_n n̂ -> begin
-                B_n̂ = $V(ptrB̂[u, n̂])
+                B_n̂ = $V(ptrB̂[1, n̂])
                 @nexprs $m2 m̂ -> begin
                     AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                 end
