@@ -4,6 +4,7 @@ using Base.Cartesian: @nexprs
 using ..LoopInfo
 using LoopVectorization: @avx
 using VectorizationBase: VectorizationBase
+using TimerOutputs: TimerOutputs, @timeit_debug, TimerOutput
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -18,6 +19,12 @@ using VectorizationBase: VectorizationBase
 
 const N_THREADS_BUFFERS = map(_->Vector{UInt8}(undef, 0), 1:Threads.nthreads())
 const PAGE_SIZE = ccall(:jl_getpagesize, Int, ())
+
+const BLAS_TIMER = TimerOutput()
+reset_timer!() = TimerOutputs.reset_timer!(BLAS_TIMER)
+get_timer() = BLAS_TIMER
+enable_timer() = TimerOutputs.enable_debug_timings(@__MODULE__)
+disable_timer() = TimerOutputs.disable_debug_timings(@__MODULE__)
 
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
@@ -95,9 +102,9 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
             _β = cachep₁ == 1 ? β : one(β)
             ps = cachep₂ - cachep₁ + 1
-            packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
+            @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
-                packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
+                @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
                     Boffset = (microj₁ - cachej₁) * ps

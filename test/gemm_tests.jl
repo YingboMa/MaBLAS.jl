@@ -1,6 +1,7 @@
 using Test
 using MaBLAS
 using LinearAlgebra
+using TimerOutputs
 
 @testset "Size check" begin
     C = randn(12, 11); A = rand(2, 3); B = rand(2, 3)
@@ -55,10 +56,25 @@ end
     @test_throws ArgumentError MaBLAS.mul!(C, A, B; cache_params=cache_params, packing=true)
 end
 
-@testset "Transposes/Adjoints" begin
+@testset "Timer & Transposes/Adjoints" begin
     m, k, n = 73, 131, 257 # all prime numbers
     C = rand(m, n)
+    timer = MaBLAS.get_timer()
+    MaBLAS.enable_timer()
+    MaBLAS.reset_timer!()
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, ), A in (rand(m, k), rand(k, m)'), B in (rand(k, n), rand(n, k)')
         @test MaBLAS.mul!((copy(C)), A, B, α, β; packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
+    tim, alloc = TimerOutputs.totmeasured(timer)
+    @test tim > 0
+    @test alloc == 0
+    display(timer)
+
+    MaBLAS.reset_timer!()
+    MaBLAS.disable_timer()
+    for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, ), A in (rand(m, k), rand(k, m)'), B in (rand(k, n), rand(n, k)')
+        @test MaBLAS.mul!((copy(C)), A, B, α, β; packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+    end
+    display(timer)
+    @test all(iszero, TimerOutputs.totmeasured(timer))
 end
