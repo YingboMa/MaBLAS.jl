@@ -4,7 +4,7 @@ using Base.Cartesian: @nexprs
 using ..LoopInfo
 using LoopVectorization: @avx
 using VectorizationBase: VectorizationBase
-using TimerOutputs
+using TimerOutputs: @timeit_debug, TimerOutput
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -21,7 +21,10 @@ const N_THREADS_BUFFERS = map(_->Vector{UInt8}(undef, 0), 1:Threads.nthreads())
 const PAGE_SIZE = ccall(:jl_getpagesize, Int, ())
 
 const BLAS_TIMER = TimerOutput()
-clear_timer!() = reset_timer!(BLAS_TIMER)
+reset_timer!() = TimerOutputs.reset_timer!(BLAS_TIMER)
+get_timer() = BLAS_TIMER
+enable_timer() = TimerOutputs.enable_debug_timings(@__MODULE__)
+disable_timer() = TimerOutputs.disable_debug_timings(@__MODULE__)
 
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
@@ -47,7 +50,7 @@ end
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=false, time::Union{Val{true},Val{false}}=Val(false))
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=false)
     m, k, n = checkmulsize(C, A, B)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
@@ -65,9 +68,9 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
     end
     # assume Float64 for now
     if packing
-        packing_mul!(C, A, B, α, β, cache_params, kernel_params, time)
+        packing_mul!(C, A, B, α, β, cache_params, kernel_params)
     else
-        tiling_mul!(C, A, B, α, β, cache_params, kernel_params, time)
+        tiling_mul!(C, A, B, α, β, cache_params, kernel_params)
     end
     return C
 end
@@ -76,7 +79,7 @@ end
 ### Lower-level `_mul!`
 ###
 
-function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}, ::Val{time}) where {micro_m,micro_n,time}
+function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     cs1 = stride(C, 1)
     if cs1 != 1
         throw(ArgumentError("packing_mul! doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
@@ -99,17 +102,9 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
             _β = cachep₁ == 1 ? β : one(β)
             ps = cachep₂ - cachep₁ + 1
-            if time
-                @timeit BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
-            else
-                packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
-            end
+            @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
-                if time
-                    @timeit BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
-                else
-                    packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
-                end
+                @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
                     Boffset = (microj₁ - cachej₁) * ps
@@ -135,8 +130,7 @@ function packing_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_param
     return C
 end
 
-function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}, ::Val{time}) where {micro_m,micro_n,time}
-    time && reset_timer!(BLAS_TIMER)
+function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     cs1 = stride(C, 1)
     as1 = stride(A, 1)
     bs1 = stride(B, 1)
@@ -154,19 +148,11 @@ function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            if time
-                                @timeit BLAS_TIMER "Micro kernel" tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, kernel_params)
-                            else
-                                tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, kernel_params)
-                            end
+                            tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, kernel_params)
                         else
                             # (mleft × ks) * (ks × nleft)
                             # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-                            if time
-                                @timeit BLAS_TIMER "Clean up kernel" cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
-                            else
-                                cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
-                            end
+                            cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
                         end
                     end # microi
                 end # microj
