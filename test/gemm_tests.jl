@@ -16,7 +16,9 @@ end
     A = rand(m, k)
     B = rand(k, n)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, false)
-        @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        for kernel_params in [(Val(8), Val(6)), (Val(12), Val(4))]
+            @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        end
     end
 end
 
@@ -29,7 +31,9 @@ end
     A = rand(m, k)
     B = rand(k, n)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packing in (true, false)
-        @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        for kernel_params in [(Val(8), Val(6)), (Val(12), Val(4))]
+            @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=packing) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+        end
     end
 end
 
