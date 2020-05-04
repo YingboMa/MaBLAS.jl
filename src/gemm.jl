@@ -4,7 +4,7 @@ using Base.Cartesian: @nexprs
 using ..LoopInfo
 using LoopVectorization: @avx
 using VectorizationBase: VectorizationBase
-using TimerOutputs: @timeit_debug, TimerOutput
+using TimerOutputs: TimerOutputs, @timeit_debug, TimerOutput
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
