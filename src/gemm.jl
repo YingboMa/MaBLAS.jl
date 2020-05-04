@@ -308,79 +308,96 @@ end
 
 # (micro_m × ks) * (ks × micro_n)
 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-@generated function tiling_microkernel!(C::StridedMatrix{T}, A::StridedMatrix{T}, B::StridedMatrix{T}, α, β,
-                                       i, j, p₁, p₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+@generated function tiling_microkernel!(C::StridedMatrix{T}, A::SIMD.ContiguousArray{T}, B::StridedMatrix{T}, α, β,
+                                        i, j, p₁, p₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(T)
     V = Vec{N,T}
-    MM = _MM{N}
     unroll = 4
     m2 = micro_m ÷ N
 
-    quote
-        $(Expr(:meta,:noinline))
+    kernel_code = quote
+        st = sizeof(T)
+        sc1 = stride(C, 1) * st
+        sc2 = stride(C, 2) * st
+        sa1 = stride(A, 1) * st
+        sa2 = stride(A, 2) * st
+        sb1 = stride(B, 1) * st
+        sb2 = stride(B, 2) * st
+        lane = VecRange{$N}(0)
+
         punroll, pleft = divrem(p₂ - p₁ + 1, $unroll)
 
-        ptrĈ = stridedpointer(C, i, j)
-        ptrÂ = stridedpointer(A, i, p₁)
-        ptrB̂ = stridedpointer(B, p₁, j)
+        ptrĈ = pointer(C) + sc1 * (i  - 1) + sc2 * (j  - 1)
+        ptrÂ = pointer(A) + sa1 * (i  - 1) + sa2 * (p₁ - 1)
+        ptrB̂ = pointer(B) + sb1 * (p₁ - 1) + sb2 * (j  - 1)
 
         # prefetch C matrix
         # TODO
         @nexprs $micro_n n̂ -> begin
-            prefetcht0(ptrĈ + offset(ptrĈ, (0, n̂ - 1)) + 7*2)
+            prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
         end
 
-        # rank-1 updates
+        # initialize registers
         @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
+
+        # rank-1 updates
         for _ in 1:punroll
             @nexprs $unroll u -> begin
                 @nexprs $m2 m̂ -> begin
-                    vecidx = $MM((m̂ - 1) * $N + 1)
-                    A_m̂ = ptrÂ[vecidx, u]
+                    # assumption: A has unit leading stride
+                    A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st + (u - 1) * sa2)
                 end
                 @nexprs $micro_n n̂ -> begin
-                    B_n̂ = $V(ptrB̂[u, n̂])
+                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2 + (u - 1) * sb1))
                     @nexprs $m2 m̂ -> begin
                         AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                     end
                 end
             end
-            ptrÂ += offset(ptrÂ, (0, $unroll))
-            ptrB̂ += offset(ptrB̂, ($unroll, 0))
+            ptrÂ += $unroll * sa2
+            ptrB̂ += $unroll * sb1
         end
-
         for _ in 1:pleft
             @nexprs $m2 m̂ -> begin
-                vecidx = $MM((m̂ - 1) * $N + 1)
-                A_m̂ = ptrÂ[vecidx, 1]
+                # assumption: A has unit leading stride
+                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st)
             end
             @nexprs $micro_n n̂ -> begin
-                B_n̂ = $V(ptrB̂[1, n̂])
+                B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2))
                 @nexprs $m2 m̂ -> begin
                     AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
-            ptrÂ += offset(ptrÂ, (0, 1))
-            ptrB̂ += offset(ptrB̂, (1, 0))
+            ptrÂ += sa2
+            ptrB̂ += sb1
         end
 
         _α = $V(α)
         if iszero(β)
             @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
                 C_m̂_n̂ = _α * AB_m̂_n̂
-                vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * $N + 1, n̂))
+                vstore(C_m̂_n̂, ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2)
             end
         else
             _β = $V(β)
             @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
-                C_m̂_n̂ = _β * vload(ptrĈ, ($MM((m̂ - 1) * $N + 1), n̂))
+                addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
+                C_m̂_n̂ = _β * vload($V, addr)
                 C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
-                vstore!(ptrĈ, C_m̂_n̂, ((m̂ - 1) * $N + 1, n̂))
+                vstore(C_m̂_n̂, addr)
             end
         end
 
         return nothing
     end
+
+    expr = quote
+        @inbounds begin
+            $(Expr(:meta,:noinline))
+            $kernel_code
+        end
+    end
+    return expr
 end
 #TODO: (A'B), AB', and A'B'
 
