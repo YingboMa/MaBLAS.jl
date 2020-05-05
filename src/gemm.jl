@@ -76,12 +76,14 @@ end
 ###
 
 function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
-    cs1 = stride(C, 1)
+    cs1 = _stride(C, 1)
+    as1 = _stride(A, 1)
+    bs1 = _stride(B, 1)
     if packa && packb
         cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
-    elseif (as1 = stride(A, 1); packa)
+    elseif packa
         cs1 == bs1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and B matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
-    elseif (bs1 = stride(B, 1); packb)
+    elseif packb
         cs1 == as1 == 1 || throw(ArgumentError("Kernel with packed B doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     else
         cs1 == as1 == bs1 == 1 || throw(ArgumentError("Tiling kernel doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
@@ -117,11 +119,11 @@ function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
                     for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
-                        Coffset = (microi₁ - 1) * stride(C, 1) + (microj₁ - 1) * stride(C, 2)
+                        Coffset = (microi₁ - 1) * _stride(C, 1) + (microj₁ - 1) * _stride(C, 2)
                         Aoffset = packa ? (microi₁ - cachei₁) * ps :
-                            (microi₁ - 1) * stride(A, 1) + (cachep₁ - 1) * stride(A, 2)
+                            (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
                         Boffset = packb ? (microj₁ - cachej₁) * ps :
-                            (cachep₁ - 1) * stride(B, 1) + (microj₁ - 1) * stride(B, 2)
+                            (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
 
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
@@ -210,7 +212,7 @@ end
 ### Micro kernel
 ###
 
-@generated function microkernel!(C::StridedMatrix{T}, A::SIMD.ContiguousArray{T}, B::StridedArray{T}, α, β,
+@generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(T)
     V = Vec{N,T}
@@ -221,15 +223,15 @@ end
 
     kernel_code = quote
         st = sizeof(T)
-        sc1 = stride(C, 1) * st
-        sc2 = stride(C, 2) * st
+        sc1 = _stride(C, 1) * st
+        sc2 = _stride(C, 2) * st
         if $matA
-            sa1 = stride(A, 1) * st
-            sa2 = stride(A, 2) * st
+            sa1 = _stride(A, 1) * st
+            sa2 = _stride(A, 2) * st
         end
         if $matB
-            sb1 = stride(B, 1) * st
-            sb2 = stride(B, 2) * st
+            sb1 = _stride(B, 1) * st
+            sb2 = _stride(B, 2) * st
         end
 
         punroll, pleft = divrem(ps, $unroll)
@@ -386,6 +388,9 @@ function checkmulsize(C, A, B)
     (cm == am && ak == bk && cn == bn) || throw(DimensionMismatch("C has dimensions ($cm, $cn), A has dimensions ($am, $ak), but B has dimensions ($bk, $bn)"))
     return cm, ak, bn
 end
+
+_stride(A, n) = stride(A, n)
+_stride(A::Union{Adjoint,Transpose}, n) = reverse(strides(parent(A)))[n]
 
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
