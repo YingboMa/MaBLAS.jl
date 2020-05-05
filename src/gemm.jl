@@ -50,7 +50,7 @@ end
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=false)
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=(false, false))
     m, k, n = checkmulsize(C, A, B)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
@@ -75,22 +75,20 @@ end
 ### Lower-level `_mul!`
 ###
 
-function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     cs1 = stride(C, 1)
-    if packing
-        if cs1 != 1
-            throw(ArgumentError("packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
-        end
+    if packa && packb
+        cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
+    elseif (as1 = stride(A, 1); packa)
+        cs1 == bs1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and B matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
+    elseif (bs1 = stride(B, 1); packb)
+        cs1 == as1 == 1 || throw(ArgumentError("Kernel with packed B doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     else
-        as1 = stride(A, 1)
-        bs1 = stride(B, 1)
-        if !(cs1 == as1 == bs1 == 1)
-            throw(ArgumentError("tiling kernel doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
-        end
+        cs1 == as1 == bs1 == 1 || throw(ArgumentError("Tiling kernel doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
     m, k, n = checkmulsize(C, A, B)
 
-    if packing
+    if packa || packb
         # get buffer
         Abuffersize = cache_m * cache_k
         Bbuffersize = cache_k * cache_n
@@ -99,8 +97,10 @@ function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kern
         buffer = N_THREADS_BUFFERS[Threads.threadid()]
         resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
         ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
-        Abuffer = unsafe_wrap(Array, ptrbuffer, Abuffersize); ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
-        Bbuffer = unsafe_wrap(Array, ptrbuffer, Bbuffersize); ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
+        Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
+        ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
+        Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
+        ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
         ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
     else
         Abuffer = A
@@ -111,27 +111,24 @@ function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kern
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
             _β = cachep₁ == 1 ? β : one(β)
             ps = cachep₂ - cachep₁ + 1
-            packing && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
+            packb && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
-                packing && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
+                packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
                     for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
                         Coffset = (microi₁ - 1) * stride(C, 1) + (microj₁ - 1) * stride(C, 2)
-                        if packing
-                            Aoffset = (microi₁ - cachei₁) * ps
-                            Boffset = (microj₁ - cachej₁) * ps
-                        else
-                            Aoffset = (microi₁ - 1) * stride(A, 1) + (cachep₁ - 1) * stride(A, 2)
-                            Boffset = (cachep₁ - 1) * stride(B, 1) + (microj₁ - 1) * stride(B, 2)
-                        end
+                        Aoffset = packa ? (microi₁ - cachei₁) * ps :
+                            (microi₁ - 1) * stride(A, 1) + (cachep₁ - 1) * stride(A, 2)
+                        Boffset = packb ? (microj₁ - cachej₁) * ps :
+                            (cachep₁ - 1) * stride(B, 1) + (microj₁ - 1) * stride(B, 2)
 
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
                             microkernel!(C, Abuffer, Bbuffer, α, _β,  Coffset, Aoffset, Boffset, ps, kernel_params)
                         else
-                            if packing
+                            if packa || packb
                                 # microkernel writes to the `AB` buffer
                                 microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
                                 # copy the `AB` buffer to `C` with `β` scaling
