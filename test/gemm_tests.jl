@@ -57,10 +57,8 @@ end
         @test LinearAlgebra.mul!((copy(C)), A, B) ≈ MaBLAS.mul!(C, A, B; cache_params=cache_params, packing=(true, packb))
     end
 
-    @test_throws ArgumentError MaBLAS.mul!(C, B, A)
-    @test_throws ArgumentError MaBLAS.mul!(C, B, A; packing=(true, false))
-    for packa in (true, false)
-        @test LinearAlgebra.mul!((copy(C)), B, A) ≈ MaBLAS.mul!(C, B, A; cache_params=cache_params, packing=(packa, true))
+    for packa in (true, false), packb in (true, false)
+        @test LinearAlgebra.mul!((copy(C)), B, A) ≈ MaBLAS.mul!(C, B, A; cache_params=cache_params, packing=(packa, packb))
     end
 
     C = @view V[1:2:end, 101:end]

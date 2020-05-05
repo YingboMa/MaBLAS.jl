@@ -26,6 +26,8 @@ get_timer() = BLAS_TIMER
 enable_timer() = TimerOutputs.enable_debug_timings(@__MODULE__)
 disable_timer() = TimerOutputs.disable_debug_timings(@__MODULE__)
 
+const FA{T,N} = SIMD.FastContiguousArray{T,N}
+
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
     a::T
@@ -79,14 +81,9 @@ function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_
     cs1 = _stride(C, 1)
     as1 = _stride(A, 1)
     bs1 = _stride(B, 1)
-    if packa && packb
-        cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
-    elseif packa
-        cs1 == bs1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and B matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
-    elseif packb
-        cs1 == as1 == 1 || throw(ArgumentError("Kernel with packed B doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
-    else
-        cs1 == as1 == bs1 == 1 || throw(ArgumentError("Tiling kernel doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
+    cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
+    if !packa
+        as1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
     m, k, n = checkmulsize(C, A, B)
 
@@ -236,9 +233,9 @@ end
 
         punroll, pleft = divrem(ps, $unroll)
 
-        ptrĈ = pointer(C) + Coffset * st
-        ptrÂ = pointer(A) + Aoffset * st
-        ptrB̂ = pointer(B) + Boffset * st
+        ptrĈ = _pointer(C) + Coffset * st
+        ptrÂ = _pointer(A) + Aoffset * st
+        ptrB̂ = _pointer(B) + Boffset * st
 
         # prefetch C matrix
         # TODO
@@ -335,7 +332,7 @@ end
 
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
+function cleanup_tiling_microkernel!(C, A::FA, B::FA, α, β, i, j, p₁, p₂, mleft, nleft)
     if iszero(β)
         @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
@@ -349,6 +346,29 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, n
             ABîĵ = zero(eltype(C))
             for p̂ in p₁:p₂
                 ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+            end
+            Cîĵ = C[î, ĵ]
+            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
+        end
+    end
+    return nothing
+end
+
+# fallback: @avx miss compiles non-unit stride matrix
+function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
+    if iszero(β)
+        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+            ABîĵ = zero(eltype(C))
+            for p̂ in p₁:p₂
+                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
+            end
+            C[î, ĵ] = α * ABîĵ
+        end
+    else
+        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+            ABîĵ = zero(eltype(C))
+            for p̂ in p₁:p₂
+                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
             end
             Cîĵ = C[î, ĵ]
             C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
@@ -389,8 +409,12 @@ function checkmulsize(C, A, B)
     return cm, ak, bn
 end
 
-_stride(A, n) = stride(A, n)
-_stride(A::Union{Adjoint,Transpose}, n) = reverse(strides(parent(A)))[n]
+@inline _stride(A, n) = stride(A, n)
+@inline _pointer(A) = pointer(A)
+#@inline _stride(A::Union{Adjoint,Transpose}, n) = reverse(strides(parent(A)))[n]
+#Not very safe, but okay
+@inline _stride(A::Union{Adjoint,Transpose}, n) = n == 1 ? stride(parent(A), 2) : stride(parent(A), 1)
+@inline _pointer(A::Union{Adjoint,Transpose}) = pointer(parent(A))
 
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
