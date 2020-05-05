@@ -66,12 +66,8 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
         end
         return C
     end
-    packing_mul!(C, A, B, α, β, packing, cache_params, kernel_params)
-    #if packing
-    #    packing_mul!(C, A, B, α, β, packing, cache_params, kernel_params)
-    #else
-    #    tiling_mul!(C, A, B, α, β, cache_params, kernel_params)
-    #end
+    # packing strategy
+    _mul!(C, A, B, α, β, packing, cache_params, kernel_params)
     return C
 end
 
@@ -79,11 +75,11 @@ end
 ### Lower-level `_mul!`
 ###
 
-function packing_mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     cs1 = stride(C, 1)
     if packing
         if cs1 != 1
-            throw(ArgumentError("packing_mul! doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
+            throw(ArgumentError("packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
         end
     else
         as1 = stride(A, 1)
@@ -112,7 +108,7 @@ function packing_mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n
     end
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
-        for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
+        for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
             _β = cachep₁ == 1 ? β : one(β)
             ps = cachep₂ - cachep₁ + 1
             packing && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
@@ -144,38 +140,6 @@ function packing_mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n
                             else
                                 cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
                             end
-                        end
-                    end # microi
-                end # microj
-            end # cachei
-        end # cachep
-    end # cachej
-    return C
-end
-
-function tiling_mul!(C, A, B, α, β, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
-    cs1 = stride(C, 1)
-    as1 = stride(A, 1)
-    bs1 = stride(B, 1)
-    if !(cs1 == as1 == bs1 == 1)
-        throw(ArgumentError("tiling_mul! doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
-    end
-    m, k, n = checkmulsize(C, A, B)
-    for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
-        for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k)
-            _β = cachep₁ == 1 ? β : one(β)
-            for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
-                # macrokernel
-                for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
-                    for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
-                        if nleft == micro_n && mleft == micro_m
-                            # (micro_m × ks) * (ks × micro_n)
-                            # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, kernel_params)
-                        else
-                            # (mleft × ks) * (ks × nleft)
-                            # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-                            cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
                         end
                     end # microi
                 end # microj
@@ -275,11 +239,7 @@ end
 
         ptrĈ = pointer(C) + Coffset * st
         ptrÂ = pointer(A) + Aoffset * st
-        if $matB
-            ptrB̂ = pointer(B) + Boffset * st
-        else
-            idxB = Boffset
-        end
+        ptrB̂ = pointer(B) + Boffset * st
 
         # prefetch C matrix
         # TODO
@@ -309,7 +269,7 @@ end
                     if $matB
                         B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2 + (u - 1) * sb1))
                     else
-                        B_n̂ = $V(B[idxB + n̂ + (u - 1) * $micro_n])
+                        B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st + (u - 1) * $micro_n * st))
                     end
                     @nexprs $m2 m̂ -> begin
                         AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
@@ -317,11 +277,7 @@ end
                 end
             end
             ptrÂ += $matA ? $unroll * sa2 : $unroll * $micro_m * st
-            if $matB
-                ptrB̂ += $unroll * sb1
-            else
-                idxB += $unroll * $micro_n
-            end
+            ptrB̂ += $matB ? $unroll * sb1 : $unroll * $micro_n * st
         end
 
         for _ in 1:pleft
@@ -335,112 +291,14 @@ end
                 if $matB
                     B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2))
                 else
-                    B_n̂ = $V(B[idxB + n̂])
+                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st))
                 end
                 @nexprs $m2 m̂ -> begin
                     AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
             ptrÂ += $matA ? sa2 : $micro_m * st
-            if $matB
-                ptrB̂ += sb1
-            else
-                idxB += $micro_n
-            end
-        end
-
-        _α = $V(α)
-        if iszero(β)
-            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
-                C_m̂_n̂ = _α * AB_m̂_n̂
-                vstore(C_m̂_n̂, ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2)
-            end
-        else
-            _β = $V(β)
-            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
-                addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
-                C_m̂_n̂ = _β * vload($V, addr)
-                C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
-                vstore(C_m̂_n̂, addr)
-            end
-        end
-
-        return nothing
-    end
-
-    expr = quote
-        @inbounds begin
-            $(Expr(:meta,:noinline))
-            $kernel_code
-        end
-    end
-    return expr
-end
-
-# (micro_m × ks) * (ks × micro_n)
-# Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-@generated function tiling_microkernel!(C::StridedMatrix{T}, A::SIMD.ContiguousArray{T}, B::StridedMatrix{T}, α, β,
-                                        i, j, p₁, p₂, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
-    N = VectorizationBase.pick_vector_width(T)
-    V = Vec{N,T}
-    unroll = 4
-    m2 = micro_m ÷ N
-
-    kernel_code = quote
-        st = sizeof(T)
-        sc1 = stride(C, 1) * st
-        sc2 = stride(C, 2) * st
-        sa1 = stride(A, 1) * st
-        sa2 = stride(A, 2) * st
-        sb1 = stride(B, 1) * st
-        sb2 = stride(B, 2) * st
-        lane = VecRange{$N}(0)
-
-        punroll, pleft = divrem(p₂ - p₁ + 1, $unroll)
-
-        ptrĈ = pointer(C) + sc1 * (i  - 1) + sc2 * (j  - 1)
-        ptrÂ = pointer(A) + sa1 * (i  - 1) + sa2 * (p₁ - 1)
-        ptrB̂ = pointer(B) + sb1 * (p₁ - 1) + sb2 * (j  - 1)
-
-        # prefetch C matrix
-        # TODO
-        @nexprs $micro_n n̂ -> begin
-            prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
-        end
-
-        # initialize registers
-        @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
-
-        # rank-1 updates
-        for _ in 1:punroll
-            @nexprs $unroll u -> begin
-                @nexprs $m2 m̂ -> begin
-                    # assumption: A has unit leading stride
-                    A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st + (u - 1) * sa2)
-                end
-                @nexprs $micro_n n̂ -> begin
-                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2 + (u - 1) * sb1))
-                    @nexprs $m2 m̂ -> begin
-                        AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
-                    end
-                end
-            end
-            ptrÂ += $unroll * sa2
-            ptrB̂ += $unroll * sb1
-        end
-        for _ in 1:pleft
-            @nexprs $m2 m̂ -> begin
-                # assumption: A has unit leading stride
-                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st)
-            end
-            @nexprs $micro_n n̂ -> begin
-                B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2))
-                @nexprs $m2 m̂ -> begin
-                    AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
-                end
-            end
-            ptrÂ += sa2
-            ptrB̂ += sb1
+            ptrB̂ += $matB ? sb1 : $micro_n * st
         end
 
         _α = $V(α)
@@ -495,32 +353,6 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, n
             end
             Cîĵ = C[î, ĵ]
             C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
-        end
-    end
-    return nothing
-end
-
-function _cleanup_tiling_microkernel!(C, A, B, α, β, Coffset, Aoffset, Boffset, ps, mleft, nleft)
-    CI = LinearIndices(C)
-    AI = LinearIndices(A)
-    BI = LinearIndices(B)
-    if iszero(β)
-        for ĵ in 1:nleft, î in 1:mleft
-            ABîĵ = zero(eltype(C))
-            for p̂ in 1:ps
-                ABîĵ = muladd(A[AI[î, p̂] + Aoffset], B[BI[p̂, ĵ] + Boffset], ABîĵ)
-            end
-            C[CI[î, ĵ] + Coffset] = α * ABîĵ
-        end
-    else
-        @avx for ĵ in 1:nleft, î in 1:mleft
-            ABîĵ = zero(eltype(C))
-            for p̂ in 1:ps
-                ABîĵ = muladd(A[AI[î, p̂] + Aoffset], B[BI[p̂, ĵ] + Boffset], ABîĵ)
-            end
-            ii = CI[î, ĵ] + Coffset
-            Cîĵ = C[ii]
-            C[ii] = muladd(α, ABîĵ, β * Cîĵ)
         end
     end
     return nothing
