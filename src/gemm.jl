@@ -87,6 +87,8 @@ function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_
     end
     m, k, n = checkmulsize(C, A, B)
 
+    cache_k = cld(K, cld(K, cache_k)) # More evenly divide K
+    
     if packa || packb
         # get buffer
         Abuffersize = cache_m * cache_k
