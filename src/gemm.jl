@@ -69,7 +69,20 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
         return C
     end
     # packing strategy
-    _mul!(C, A, B, α, β, packing, cache_params, kernel_params)
+    packa, packb = packing
+    if packa # manual union split
+        if packb
+            _mul!(C, A, B, α, β, (Val(true),Val(true)), cache_params, kernel_params)
+        else
+            _mul!(C, A, B, α, β, (Val(true),Val(false)), cache_params, kernel_params)
+        end
+    else
+        if packb
+            _mul!(C, A, B, α, β, (Val(false),Val(true)), cache_params, kernel_params)
+        else
+            _mul!(C, A, B, α, β, (Val(false),Val(false)), cache_params, kernel_params)
+        end
+    end
     return C
 end
 
@@ -79,7 +92,7 @@ partition_k(k, cache_k) = cld(k, cld(k, cache_k))
 ### Lower-level `_mul!`
 ###
 
-function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
     cs1 = _stride(C, 1)
     as1 = _stride(A, 1)
     bs1 = _stride(B, 1)
