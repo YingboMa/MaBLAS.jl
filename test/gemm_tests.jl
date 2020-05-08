@@ -23,6 +23,12 @@ end
     end
 end
 
+@testset "Block size tests" begin
+    @test MaBLAS.partition_k(2000, 532) == 500
+    @test MaBLAS.partition_k(401, 400) == 201
+    @test MaBLAS.partition_k(900, 400) == 300
+end
+
 @testset "Clean up loop tests" begin
     _m, _k, _n = 8*3, 8, 6*5
     # lower cache_params to check clean up loops more easily
