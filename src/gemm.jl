@@ -26,6 +26,8 @@ get_timer() = BLAS_TIMER
 enable_timer() = TimerOutputs.enable_debug_timings(@__MODULE__)
 disable_timer() = TimerOutputs.disable_debug_timings(@__MODULE__)
 
+const FA{T,N} = SIMD.FastContiguousArray{T,N}
+
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
     a::T
@@ -50,7 +52,7 @@ end
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=false)
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=(false, false))
     m, k, n = checkmulsize(C, A, B)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
@@ -75,22 +77,17 @@ end
 ### Lower-level `_mul!`
 ###
 
-function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
-    cs1 = stride(C, 1)
-    if packing
-        if cs1 != 1
-            throw(ArgumentError("packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
-        end
-    else
-        as1 = stride(A, 1)
-        bs1 = stride(B, 1)
-        if !(cs1 == as1 == bs1 == 1)
-            throw(ArgumentError("tiling kernel doesn't support nonunit leading stride matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
-        end
+function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+    cs1 = _stride(C, 1)
+    as1 = _stride(A, 1)
+    bs1 = _stride(B, 1)
+    cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
+    if !packa
+        as1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
     m, k, n = checkmulsize(C, A, B)
 
-    if packing
+    if packa || packb
         # get buffer
         Abuffersize = cache_m * cache_k
         Bbuffersize = cache_k * cache_n
@@ -99,8 +96,10 @@ function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kern
         buffer = N_THREADS_BUFFERS[Threads.threadid()]
         resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
         ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
-        Abuffer = unsafe_wrap(Array, ptrbuffer, Abuffersize); ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
-        Bbuffer = unsafe_wrap(Array, ptrbuffer, Bbuffersize); ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
+        Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
+        ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
+        Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
+        ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
         ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
     else
         Abuffer = A
@@ -111,27 +110,24 @@ function _mul!(C, A, B, α, β, packing::Bool, (cache_m, cache_k, cache_n), kern
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
             _β = cachep₁ == 1 ? β : one(β)
             ps = cachep₂ - cachep₁ + 1
-            packing && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
+            packb && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
-                packing && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
+                packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
                 for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
                     for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
-                        Coffset = (microi₁ - 1) * stride(C, 1) + (microj₁ - 1) * stride(C, 2)
-                        if packing
-                            Aoffset = (microi₁ - cachei₁) * ps
-                            Boffset = (microj₁ - cachej₁) * ps
-                        else
-                            Aoffset = (microi₁ - 1) * stride(A, 1) + (cachep₁ - 1) * stride(A, 2)
-                            Boffset = (cachep₁ - 1) * stride(B, 1) + (microj₁ - 1) * stride(B, 2)
-                        end
+                        Coffset = (microi₁ - 1) * _stride(C, 1) + (microj₁ - 1) * _stride(C, 2)
+                        Aoffset = packa ? (microi₁ - cachei₁) * ps :
+                            (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
+                        Boffset = packb ? (microj₁ - cachej₁) * ps :
+                            (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
 
                         if nleft == micro_n && mleft == micro_m
                             # (micro_m × ks) * (ks × micro_n)
                             # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
                             microkernel!(C, Abuffer, Bbuffer, α, _β,  Coffset, Aoffset, Boffset, ps, kernel_params)
                         else
-                            if packing
+                            if packa && packb
                                 # microkernel writes to the `AB` buffer
                                 microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
                                 # copy the `AB` buffer to `C` with `β` scaling
@@ -213,7 +209,7 @@ end
 ### Micro kernel
 ###
 
-@generated function microkernel!(C::StridedMatrix{T}, A::SIMD.ContiguousArray{T}, B::StridedArray{T}, α, β,
+@generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(T)
     V = Vec{N,T}
@@ -224,22 +220,22 @@ end
 
     kernel_code = quote
         st = sizeof(T)
-        sc1 = stride(C, 1) * st
-        sc2 = stride(C, 2) * st
+        sc1 = _stride(C, 1) * st
+        sc2 = _stride(C, 2) * st
         if $matA
-            sa1 = stride(A, 1) * st
-            sa2 = stride(A, 2) * st
+            sa1 = _stride(A, 1) * st
+            sa2 = _stride(A, 2) * st
         end
         if $matB
-            sb1 = stride(B, 1) * st
-            sb2 = stride(B, 2) * st
+            sb1 = _stride(B, 1) * st
+            sb2 = _stride(B, 2) * st
         end
 
         punroll, pleft = divrem(ps, $unroll)
 
-        ptrĈ = pointer(C) + Coffset * st
-        ptrÂ = pointer(A) + Aoffset * st
-        ptrB̂ = pointer(B) + Boffset * st
+        ptrĈ = _pointer(C) + Coffset * st
+        ptrÂ = _pointer(A) + Aoffset * st
+        ptrB̂ = _pointer(B) + Boffset * st
 
         # prefetch C matrix
         # TODO
@@ -336,7 +332,7 @@ end
 
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
+function cleanup_tiling_microkernel!(C, A::FA, B::FA, α, β, i, j, p₁, p₂, mleft, nleft)
     if iszero(β)
         @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
@@ -350,6 +346,29 @@ function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, n
             ABîĵ = zero(eltype(C))
             for p̂ in p₁:p₂
                 ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
+            end
+            Cîĵ = C[î, ĵ]
+            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
+        end
+    end
+    return nothing
+end
+
+# fallback: @avx miss compiles non-unit stride matrix
+function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
+    if iszero(β)
+        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+            ABîĵ = zero(eltype(C))
+            for p̂ in p₁:p₂
+                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
+            end
+            C[î, ĵ] = α * ABîĵ
+        end
+    else
+        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+            ABîĵ = zero(eltype(C))
+            for p̂ in p₁:p₂
+                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
             end
             Cîĵ = C[î, ĵ]
             C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
@@ -389,6 +408,13 @@ function checkmulsize(C, A, B)
     (cm == am && ak == bk && cn == bn) || throw(DimensionMismatch("C has dimensions ($cm, $cn), A has dimensions ($am, $ak), but B has dimensions ($bk, $bn)"))
     return cm, ak, bn
 end
+
+@inline _stride(A, n) = stride(A, n)
+@inline _pointer(A) = pointer(A)
+#@inline _stride(A::Union{Adjoint,Transpose}, n) = reverse(strides(parent(A)))[n]
+#Not very safe, but okay
+@inline _stride(A::Union{Adjoint,Transpose}, n) = n == 1 ? stride(parent(A), 2) : stride(parent(A), 1)
+@inline _pointer(A::Union{Adjoint,Transpose}) = pointer(parent(A))
 
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
