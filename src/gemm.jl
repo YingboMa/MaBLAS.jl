@@ -73,6 +73,8 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
     return C
 end
 
+partition_k(k, cache_k) = cld(k, cld(k, cache_k))
+
 ###
 ### Lower-level `_mul!`
 ###
@@ -87,7 +89,7 @@ function _mul!(C, A, B, α, β, (packa, packb)::NTuple{2,Bool}, (cache_m, cache_
     end
     m, k, n = checkmulsize(C, A, B)
 
-    cache_k = cld(K, cld(K, cache_k)) # More evenly divide K
+    cache_k = partition_k(k, cache_k) # More evenly divide K
     
     if packa || packb
         # get buffer
