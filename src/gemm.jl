@@ -103,7 +103,7 @@ function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_
     m, k, n = checkmulsize(C, A, B)
 
     cache_k = partition_k(k, cache_k) # More evenly divide K
-    
+
     if packa || packb
         # get buffer
         Abuffersize = cache_m * cache_k
@@ -121,46 +121,52 @@ function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_
     else
         Abuffer = A
         Bbuffer = B
+        ABbuffer = nothing
     end
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
-            _β = cachep₁ == 1 ? β : one(β)
-            ps = cachep₂ - cachep₁ + 1
+            β′ = cachep₁ == 1 ? β : one(β)
             packb && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
-                for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
-                    for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
-                        Coffset = (microi₁ - 1) * _stride(C, 1) + (microj₁ - 1) * _stride(C, 2)
-                        Aoffset = packa ? (microi₁ - cachei₁) * ps :
-                            (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
-                        Boffset = packb ? (microj₁ - cachej₁) * ps :
-                            (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
-
-                        if nleft == micro_n && mleft == micro_m
-                            # (micro_m × ks) * (ks × micro_n)
-                            # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            microkernel!(C, Abuffer, Bbuffer, α, _β,  Coffset, Aoffset, Boffset, ps, kernel_params)
-                        else
-                            if packa && packb
-                                # microkernel writes to the `AB` buffer
-                                microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
-                                # copy the `AB` buffer to `C` with `β` scaling
-                                # Ĉ = AB[1:mleft, 1:nleft]
-                                cleanup_packing!(C, ABbuffer, _β, (microi₁ - 1, microj₁ - 1), mleft, nleft)
-                            else
-                                cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
-                            end
-                        end
-                    end # microi
-                end # microj
+                macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β′, (packa, packb), (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params)
             end # cachei
         end # cachep
     end # cachej
     return C
 end
+
+function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, (packa, packb), (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+    ps = cachep₂ - cachep₁ + 1
+    for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
+        for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
+            Coffset = (microi₁ - 1) * _stride(C, 1) + (microj₁ - 1) * _stride(C, 2)
+            Aoffset = packa ? (microi₁ - cachei₁) * ps :
+            (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
+            Boffset = packb ? (microj₁ - cachej₁) * ps :
+            (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
+
+            if nleft == micro_n && mleft == micro_m
+                # (micro_m × ks) * (ks × micro_n)
+                # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
+                microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params)
+            else
+                if packa && packb
+                    # microkernel writes to the `AB` buffer
+                    microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
+                    # copy the `AB` buffer to `C` with `β` scaling
+                    # Ĉ = AB[1:mleft, 1:nleft]
+                    cleanup_packing!(C, ABbuffer, β, (microi₁ - 1, microj₁ - 1), mleft, nleft)
+                else
+                    cleanup_tiling_microkernel!(C, A, B, α, β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
+                end
+            end
+        end # microi
+    end # microj
+end
+
 
 ###
 ### Packing
@@ -223,9 +229,45 @@ function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, ::
 end
 
 ###
+### Macro kernel
+###
+
+@generated function decompose_to_microkernels(::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+    outervals = Expr(:tuple,)
+    micro_m′ = micro_m
+    micro_n′ = micro_n
+    while micro_n′ != 0
+        innervals = []
+        while micro_m′ != 0
+            push!(innervals, (Val(micro_m′), Val(micro_n′)))
+            micro_m′ = micro_m′ >> 1
+        end
+        micro_n′ = micro_n′ >> 1
+        micro_m′ = micro_m
+        push!(outervals.args, (innervals...,))
+    end
+    return outervals
+end
+
+
+###
 ### Micro kernel
 ###
 
+#8 x 6 [2 x 6] ymm
+#4 x 6 [1 x 6] ymm
+#2 x 6 [1 x 6] xmm
+#1 x 6 [1 x 6] xmm
+#
+#8 x 3 [2 x 3] ymm
+#4 x 3 [1 x 3] ymm
+#2 x 3 [1 x 3] xmm
+#1 x 3 [1 x 3] xmm
+#
+#8 x 1 [2 x 1] ymm
+#4 x 1 [1 x 1] ymm
+#2 x 1 [1 x 1] xmm
+#1 x 1 [1 x 1] xmm
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(T)
