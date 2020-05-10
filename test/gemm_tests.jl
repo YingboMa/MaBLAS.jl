@@ -3,6 +3,8 @@ using MaBLAS
 using LinearAlgebra
 using TimerOutputs
 
+noreturn_mul!(args...; kwargs...) = (MaBLAS.mul!(args...; kwargs...); nothing)
+
 @testset "Size check" begin
     C = randn(12, 11); A = rand(2, 3); B = rand(2, 3)
     @test_throws DimensionMismatch MaBLAS.mul!(C, A, B)
@@ -40,6 +42,8 @@ end
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packa in (true, false), packb in (true, false)
         for kernel_params in [(Val(8), Val(6)), (Val(12), Val(4)), (Val(4), Val(3)), (Val(3), Val(3)), (Val(2), Val(3)), (Val(1), Val(4))]
             @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb)) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+            @allocated noreturn_mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb))
+            @allocated(noreturn_mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb))) <= (packa + packb) * 176 # minor allocation when packing
         end
     end
 end
