@@ -138,6 +138,40 @@ function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_
     return C
 end
 
+###
+### Macro kernel
+###
+
+#8 x 6 [2 x 6] ymm
+#4 x 6 [1 x 6] ymm
+#2 x 6 [1 x 6] xmm
+#1 x 6 [1 x 6] xmm
+#
+#8 x 3 [2 x 3] ymm
+#4 x 3 [1 x 3] ymm
+#2 x 3 [1 x 3] xmm
+#1 x 3 [1 x 3] xmm
+#
+#8 x 1 [2 x 1] ymm
+#4 x 1 [1 x 1] ymm
+#2 x 1 [1 x 1] xmm
+#1 x 1 [1 x 1] xmm
+@generated function decompose_to_microkernels(::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+    outervals = Expr(:tuple,)
+    micro_m′ = micro_m
+    micro_n′ = micro_n
+    while micro_n′ != 0
+        innervals = []
+        while micro_m′ != 0
+            push!(innervals, (Val(micro_m′), Val(micro_n′)))
+            micro_m′ = micro_m′ >> 1
+        end
+        micro_n′ = micro_n′ >> 1
+        micro_m′ = micro_m
+        push!(outervals.args, (innervals...,))
+    end
+    return outervals
+end
 function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, (packa, packb), (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
     ps = cachep₂ - cachep₁ + 1
     for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
@@ -166,7 +200,6 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, (packa, packb
         end # microi
     end # microj
 end
-
 
 ###
 ### Packing
@@ -229,51 +262,16 @@ function packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, ::
 end
 
 ###
-### Macro kernel
-###
-
-@generated function decompose_to_microkernels(::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
-    outervals = Expr(:tuple,)
-    micro_m′ = micro_m
-    micro_n′ = micro_n
-    while micro_n′ != 0
-        innervals = []
-        while micro_m′ != 0
-            push!(innervals, (Val(micro_m′), Val(micro_n′)))
-            micro_m′ = micro_m′ >> 1
-        end
-        micro_n′ = micro_n′ >> 1
-        micro_m′ = micro_m
-        push!(outervals.args, (innervals...,))
-    end
-    return outervals
-end
-
-
-###
 ### Micro kernel
 ###
 
-#8 x 6 [2 x 6] ymm
-#4 x 6 [1 x 6] ymm
-#2 x 6 [1 x 6] xmm
-#1 x 6 [1 x 6] xmm
-#
-#8 x 3 [2 x 3] ymm
-#4 x 3 [1 x 3] ymm
-#2 x 3 [1 x 3] xmm
-#1 x 3 [1 x 3] xmm
-#
-#8 x 1 [2 x 1] ymm
-#4 x 1 [1 x 1] ymm
-#2 x 1 [1 x 1] xmm
-#1 x 1 [1 x 1] xmm
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
-    N = VectorizationBase.pick_vector_width(T)
+    N′ = VectorizationBase.pick_vector_width(T)
+    mregister′, remainder = divrem(micro_m, N′)
+    mregister, N = remainder == 0 ? (mregister′, N′) : (1, remainder)
     V = Vec{N,T}
     unroll = 4
-    m2 = micro_m ÷ N
     matA = ndims(A) == 2
     matB = ndims(B) == 2
 
@@ -303,7 +301,7 @@ end
         end
 
         # rank-1 updates
-        @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
+        @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
         for _ in 1:punroll
             @nexprs $unroll u -> begin
                 #TODO
@@ -312,7 +310,7 @@ end
                     u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $micro_n)
                 end
                 ## unroll variable: u
-                @nexprs $m2 m̂ -> begin
+                @nexprs $mregister m̂ -> begin
                     if $matA
                         # assumption: A has unit leading stride
                         A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st + (u - 1) * sa2)
@@ -326,7 +324,7 @@ end
                     else
                         B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st + (u - 1) * $micro_n * st))
                     end
-                    @nexprs $m2 m̂ -> begin
+                    @nexprs $mregister m̂ -> begin
                         AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                     end
                 end
@@ -338,7 +336,7 @@ end
         for _ in 1:pleft
             #TODO
             prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
-            @nexprs $m2 m̂ -> begin
+            @nexprs $mregister m̂ -> begin
                 # assumption: A has unit leading stride
                 A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st)
             end
@@ -348,7 +346,7 @@ end
                 else
                     B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st))
                 end
-                @nexprs $m2 m̂ -> begin
+                @nexprs $mregister m̂ -> begin
                     AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
@@ -358,13 +356,13 @@ end
 
         _α = $V(α)
         if iszero(β)
-            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
+            @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 C_m̂_n̂ = _α * AB_m̂_n̂
                 vstore(C_m̂_n̂, ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2)
             end
         else
             _β = $V(β)
-            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
+            @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
                 C_m̂_n̂ = _β * vload($V, addr)
                 C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
