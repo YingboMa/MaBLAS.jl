@@ -92,7 +92,7 @@ partition_k(k, cache_k) = cld(k, cld(k, cache_k))
 ### Lower-level `_mul!`
 ###
 
-function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
     cs1 = _stride(C, 1)
     as1 = _stride(A, 1)
     bs1 = _stride(B, 1)
@@ -131,7 +131,7 @@ function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
-                macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β′, (packa, packb), (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params)
+                macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β′, packing, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params)
             end # cachei
         end # cachep
     end # cachej
@@ -142,37 +142,7 @@ end
 ### Macro kernel
 ###
 
-#8 x 6 [2 x 6] ymm
-#4 x 6 [1 x 6] ymm
-#2 x 6 [1 x 6] xmm
-#1 x 6 [1 x 6] xmm
-#
-#8 x 3 [2 x 3] ymm
-#4 x 3 [1 x 3] ymm
-#2 x 3 [1 x 3] xmm
-#1 x 3 [1 x 3] xmm
-#
-#8 x 1 [2 x 1] ymm
-#4 x 1 [1 x 1] ymm
-#2 x 1 [1 x 1] xmm
-#1 x 1 [1 x 1] xmm
-@generated function decompose_to_microkernels(::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
-    outervals = Expr(:tuple,)
-    micro_m′ = micro_m
-    micro_n′ = micro_n
-    while micro_n′ != 0
-        innervals = []
-        while micro_m′ != 0
-            push!(innervals, (Val(micro_m′), Val(micro_n′)))
-            micro_m′ = micro_m′ >> 1
-        end
-        micro_n′ = micro_n′ >> 1
-        micro_m′ = micro_m
-        push!(outervals.args, (innervals...,))
-    end
-    return outervals
-end
-function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, (packa, packb), (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
     ps = cachep₂ - cachep₁ + 1
     for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
         for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
@@ -182,6 +152,9 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, (packa, packb
             Boffset = packb ? (microj₁ - cachej₁) * ps :
             (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
 
+            microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset,
+                          ps, mleft, nleft, packing, kernel_params)
+            #=
             if nleft == micro_n && mleft == micro_m
                 # (micro_m × ks) * (ks × micro_n)
                 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
@@ -197,6 +170,7 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, (packa, packb
                     cleanup_tiling_microkernel!(C, A, B, α, β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
                 end
             end
+            =#
         end # microi
     end # microj
 end
@@ -264,6 +238,107 @@ end
 ###
 ### Micro kernel
 ###
+
+"""
+    decompose_to_microkernels(T, micro_m, micro_n)
+
+Example: decompose_to_microkernels(Float64, 8, 6) gives
+8 x 6 [2 x 6] ymm
+4 x 6 [1 x 6] ymm
+2 x 6 [1 x 6] xmm
+1 x 6 [1 x 6] xmm
+
+8 x 3 [2 x 3] ymm
+4 x 3 [1 x 3] ymm
+2 x 3 [1 x 3] xmm
+1 x 3 [1 x 3] xmm
+
+8 x 1 [2 x 1] ymm
+4 x 1 [1 x 1] ymm
+2 x 1 [1 x 1] xmm
+1 x 1 [1 x 1] xmm
+"""
+function decompose_to_microkernels(T, micro_m, micro_n)
+    width = VectorizationBase.pick_vector_width(T)
+    micro_m′ = micro_m
+    micro_n′ = micro_n
+    width′ = width
+
+    mvals = Int[]
+    nvals = Int[]
+    while micro_m′ != 1
+        push!(mvals, micro_m′)
+        micro_m′ = micro_m′ - width′
+        micro_m′ == width′ && ( width′ >>= 1 )
+    end
+    push!(mvals, micro_m′)
+
+    while micro_n′ != 0
+        push!(nvals, micro_n′)
+        width′ = width
+        micro_n′ = micro_n′ >> 1
+        micro_m′ = micro_m
+    end
+    return mvals, nvals
+end
+
+"""
+    microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, m, n, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+
+It invokes a sequence of kernels that computes
+```julia
+Ĉ[1:m, 1:n] = Â[1:m, 1:ps] * B̂[1:ps, 1:n]
+```
+in the speed of light, where ``{⋅̂}`` denotes the matrix with offset.
+"""
+@generated function microkernels!(C, A, B, α, β,
+                                  Coffset, Aoffset, Boffset,
+                                  ps, m, n, packing::Tuple{Val{packa},Val{packb}},
+                                  kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+    msizes, nsizes = decompose_to_microkernels(eltype(C), micro_m, micro_n)
+    T = eltype(C)
+    quote
+        if packa
+        else
+        end
+        if packb
+        else
+        end
+        $([:(while n >= $n′
+                 i = m
+                 Coffset′ = Coffset
+                 Aoffset′ = Aoffset
+                 $([:(while i >= $m′
+                          # compute for mxn
+                          microkernel!(C, A, B, α, β,
+                                       Coffset, Aoffset, Boffset, ps,
+                                       (Val($m′), Val($n′)))
+                          i -= $m′
+                      end) for m′ in msizes]...)
+                 n -= $n′
+             end) for n′ in nsizes]...)
+    end
+end
+#   1 2 3 4 5 6
+# 1 x x x x x x
+# 2 x ooooo x x
+# 3 x ooooo x x
+# 4 x ooooo x x = 
+# 5 x x x x x x
+# 6 x x x x x x
+# 7 x x x x x x
+# 8 x x x x x x
+# 9 x x x x x x
+
+"""
+    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+
+A kernel that computes
+```julia
+Ĉ[1:micro_m, 1:micro_n] = Â[1:micro_m, ps] * B̂[ps, 1:micro_n]
+```
+where ``{⋅̂}`` denotes the matrix with offset.
+"""
 
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
