@@ -152,9 +152,10 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tupl
             Boffset = packb ? (microj₁ - cachej₁) * ps :
             (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
 
+            #=
             microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset,
                           ps, mleft, nleft, packing, kernel_params)
-            #=
+            =#
             if nleft == micro_n && mleft == micro_m
                 # (micro_m × ks) * (ks × micro_n)
                 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
@@ -170,7 +171,6 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tupl
                     cleanup_tiling_microkernel!(C, A, B, α, β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
                 end
             end
-            =#
         end # microi
     end # microj
 end
@@ -240,9 +240,9 @@ end
 ###
 
 """
-    decompose_to_microkernels(T, micro_m, micro_n)
+    decompose_to_microkernels(width, micro_m, micro_n)
 
-Example: decompose_to_microkernels(Float64, 8, 6) gives
+Example: decompose_to_microkernels(4, 8, 6) gives
 8 x 6 [2 x 6] ymm
 4 x 6 [1 x 6] ymm
 2 x 6 [1 x 6] xmm
@@ -258,30 +258,38 @@ Example: decompose_to_microkernels(Float64, 8, 6) gives
 2 x 1 [1 x 1] xmm
 1 x 1 [1 x 1] xmm
 """
-function decompose_to_microkernels(T, micro_m, micro_n)
-    width = VectorizationBase.pick_vector_width(T)
+function decompose_to_microkernels(width, micro_m, micro_n; maxiters=50)
     micro_m′ = micro_m
     micro_n′ = micro_n
     width′ = width
+    maxiters′ = maxiters
 
     mvals = Int[]
     nvals = Int[]
-    while micro_m′ != 1
+    while micro_m′ > 1
         push!(mvals, micro_m′)
         micro_m′ = micro_m′ - width′
         micro_m′ == width′ && ( width′ >>= 1 )
+        maxiters <= 0 && @goto ERROR
+        maxiters -= 1
     end
     push!(mvals, micro_m′)
 
-    while micro_n′ != 0
+    while micro_n′ >= 1
         push!(nvals, micro_n′)
         width′ = width
-        micro_n′ = micro_n′ >> 1
+        micro_n′ = micro_n′ - 2
         micro_m′ = micro_m
+        maxiters <= 0 && @goto ERROR
+        maxiters -= 1
     end
+    nvals[end] != 1 && push!(nvals, 1)
     return mvals, nvals
+    @label ERROR
+    error("Kernel partition did not terminate in maxiters=$maxiters′ iterations.")
 end
 
+#=
 """
     microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, m, n, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
 
@@ -306,29 +314,22 @@ in the speed of light, where ``{⋅̂}`` denotes the matrix with offset.
         end
         $([:(while n >= $n′
                  i = m
-                 Coffset′ = Coffset
-                 Aoffset′ = Aoffset
-                 $([:(while i >= $m′
-                          # compute for mxn
-                          microkernel!(C, A, B, α, β,
-                                       Coffset, Aoffset, Boffset, ps,
-                                       (Val($m′), Val($n′)))
-                          i -= $m′
+                 Coffset′, Aoffset′, Boffset′ = Coffset, Aoffset, Boffset
+                 $([:(begin
+                          while i >= $m′
+                              # compute for mxn
+                              microkernel!(C, A, B, α, β,
+                                           Coffset′, Aoffset′, Boffset′, ps,
+                                           (Val($m′), Val($n′)))
+                              i -= $m′
+                          end
+                          Coffset′ += m′
                       end) for m′ in msizes]...)
                  n -= $n′
              end) for n′ in nsizes]...)
     end
 end
-#   1 2 3 4 5 6
-# 1 x x x x x x
-# 2 x ooooo x x
-# 3 x ooooo x x
-# 4 x ooooo x x = 
-# 5 x x x x x x
-# 6 x x x x x x
-# 7 x x x x x x
-# 8 x x x x x x
-# 9 x x x x x x
+=#
 
 """
     microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
@@ -351,6 +352,8 @@ where ``{⋅̂}`` denotes the matrix with offset.
     matB = ndims(B) == 2
 
     kernel_code = quote
+        # tell the compiler that 1:ps is nonempty
+        ps < 1 && return nothing
         st = sizeof(T)
         sc1 = _stride(C, 1) * st
         sc2 = _stride(C, 2) * st
@@ -363,8 +366,6 @@ where ``{⋅̂}`` denotes the matrix with offset.
             sb2 = _stride(B, 2) * st
         end
 
-        punroll, pleft = divrem(ps, $unroll)
-
         ptrĈ = _pointer(C) + Coffset * st
         ptrÂ = _pointer(A) + Aoffset * st
         ptrB̂ = _pointer(B) + Boffset * st
@@ -375,8 +376,9 @@ where ``{⋅̂}`` denotes the matrix with offset.
             prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
         end
 
-        # rank-1 updates
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
+        punroll, pleft = divrem(ps, $unroll)
+        # rank-1 updates
         for _ in 1:punroll
             @nexprs $unroll u -> begin
                 #TODO
@@ -386,12 +388,9 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 end
                 ## unroll variable: u
                 @nexprs $mregister m̂ -> begin
-                    if $matA
-                        # assumption: A has unit leading stride
-                        A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st + (u - 1) * sa2)
-                    else
-                        A_m̂ = vload($V, ptrÂ + (u - 1) * $micro_m * st + (m̂ - 1) * $N * st)
-                    end
+                    # assumption: A has unit leading stride
+                    ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $micro_m * st)
+                    A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st)
                 end
                 @nexprs $micro_n n̂ -> begin
                     if $matB
@@ -409,7 +408,6 @@ where ``{⋅̂}`` denotes the matrix with offset.
         end
 
         for _ in 1:pleft
-            #TODO
             prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
             @nexprs $mregister m̂ -> begin
                 # assumption: A has unit leading stride
