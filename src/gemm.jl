@@ -124,6 +124,8 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
         ABbuffer = nothing
     end
 
+    # A (m × k), B (k × n)
+
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
             β′ = cachep₁ == 1 ? β : one(β)
@@ -156,6 +158,7 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tupl
             microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset,
                           ps, mleft, nleft, packing, kernel_params)
             =#
+            #microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, mleft, nleft, ps, kernel_params)
             if nleft == micro_n && mleft == micro_m
                 # (micro_m × ks) * (ks × micro_n)
                 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
@@ -248,10 +251,15 @@ Example: decompose_to_microkernels(4, 8, 6) gives
 2 x 6 [1 x 6] xmm
 1 x 6 [1 x 6] xmm
 
-8 x 3 [2 x 3] ymm
-4 x 3 [1 x 3] ymm
-2 x 3 [1 x 3] xmm
-1 x 3 [1 x 3] xmm
+8 x 4 [2 x 6] ymm
+4 x 4 [1 x 6] ymm
+2 x 4 [1 x 6] xmm
+1 x 4 [1 x 6] xmm
+
+8 x 2 [2 x 3] ymm
+4 x 2 [1 x 3] ymm
+2 x 2 [1 x 3] xmm
+1 x 2 [1 x 3] xmm
 
 8 x 1 [2 x 1] ymm
 4 x 1 [1 x 1] ymm
@@ -331,16 +339,53 @@ in the speed of light, where ``{⋅̂}`` denotes the matrix with offset.
 end
 =#
 
+# 8 x 6 # kernel size
+# ([8, 4, 2, 1], [6, 4, 2, 1])
+#
+# kernels list:
+# 8 x 6: 1 # hot kernel
+# 4 x 6: 2
+# 2 x 6
+# 1 x 6
+#
+# 8 x 4: 3
+# 4 x 4: 4
+# 2 x 4
+# 1 x 4
+#
+# 8 x 2
+# 4 x 2
+# 2 x 2
+# 1 x 2
+#
+# 8 x 1
+# 4 x 1
+# 2 x 1
+# 1 x 1
+#
+#    1 2 3 4 5 6 7 8 9 10
+# 1  x x x x x x x x x x
+# 2  x x x x x x x x x x
+# 3  x x x x x x x x x x
+# 4  x x x x x x x x x x
+# 5  x x x x x x x x x x
+# 6  x x x x x x x x x x
+# 7  x x x x x x x x x x
+# 8  x x x x x 1 x x x 3
+# 9  x x x x x x x x x x
+# 10 x x x x x x x x x x
+# 11 x x x x x x x x x x
+# 12 x x x x x 2 x x x 4
+
 """
     microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
 
 A kernel that computes
 ```julia
-Ĉ[1:micro_m, 1:micro_n] = Â[1:micro_m, ps] * B̂[ps, 1:micro_n]
+Ĉ[1:micro_m, 1:micro_n] = α * Â[1:micro_m, 1:ps] * B̂[1:ps, 1:micro_n] + β * Ĉ[1:micro_m, 1:micro_n]
 ```
 where ``{⋅̂}`` denotes the matrix with offset.
 """
-
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N′ = VectorizationBase.pick_vector_width(T)
@@ -357,11 +402,11 @@ where ``{⋅̂}`` denotes the matrix with offset.
         st = sizeof(T)
         sc1 = _stride(C, 1) * st
         sc2 = _stride(C, 2) * st
-        if $matA
+        if $matA # A is not packed
             sa1 = _stride(A, 1) * st
             sa2 = _stride(A, 2) * st
         end
-        if $matB
+        if $matB # B is not packed
             sb1 = _stride(B, 1) * st
             sb2 = _stride(B, 2) * st
         end
@@ -376,6 +421,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
             prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
         end
 
+        # intializing AB registers
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
         punroll, pleft = divrem(ps, $unroll)
         # rank-1 updates
@@ -388,16 +434,13 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 end
                 ## unroll variable: u
                 @nexprs $mregister m̂ -> begin
-                    # assumption: A has unit leading stride
+                    # assumption: A has unit leading stride, sa1 == 1
                     ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $micro_m * st)
                     A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st)
                 end
                 @nexprs $micro_n n̂ -> begin
-                    if $matB
-                        B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2 + (u - 1) * sb1))
-                    else
-                        B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st + (u - 1) * $micro_n * st))
-                    end
+                    ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $micro_n * st)
+                    B_n̂ = $V(unsafe_load(ptrB′))
                     @nexprs $mregister m̂ -> begin
                         AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                     end
