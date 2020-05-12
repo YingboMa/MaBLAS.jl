@@ -1,4 +1,4 @@
-using SIMD
+using SIMDPirates
 using LinearAlgebra: Transpose, Adjoint
 using Base.Cartesian: @nexprs
 using ..LoopInfo
@@ -25,8 +25,6 @@ reset_timer!() = TimerOutputs.reset_timer!(BLAS_TIMER)
 get_timer() = BLAS_TIMER
 enable_timer() = TimerOutputs.enable_debug_timings(@__MODULE__)
 disable_timer() = TimerOutputs.disable_debug_timings(@__MODULE__)
-
-const FA{T,N} = SIMD.FastContiguousArray{T,N}
 
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
@@ -343,6 +341,7 @@ end
 # ([8, 4, 2, 1], [6, 4, 2, 1])
 #
 # kernels list:
+# m x n
 # 8 x 6: 1 # hot kernel
 # 4 x 6: 2
 # 2 x 6
@@ -391,7 +390,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
     N′ = VectorizationBase.pick_vector_width(T)
     mregister′, remainder = divrem(micro_m, N′)
     mregister, N = remainder == 0 ? (mregister′, N′) : (1, remainder)
-    V = Vec{N,T}
+    V = SVec{N,T}
     unroll = 4
     matA = ndims(A) == 2
     matB = ndims(B) == 2
@@ -458,9 +457,9 @@ where ``{⋅̂}`` denotes the matrix with offset.
             end
             @nexprs $micro_n n̂ -> begin
                 if $matB
-                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2))
+                    B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * sb2))
                 else
-                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st))
+                    B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
                 end
                 @nexprs $mregister m̂ -> begin
                     AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
@@ -474,7 +473,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
         if iszero(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 C_m̂_n̂ = _α * AB_m̂_n̂
-                vstore(C_m̂_n̂, ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2)
+                vstore!(ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2, C_m̂_n̂)
             end
         else
             _β = $V(β)
@@ -482,7 +481,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
                 C_m̂_n̂ = _β * vload($V, addr)
                 C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
-                vstore(C_m̂_n̂, addr)
+                vstore!(addr, C_m̂_n̂)
             end
         end
 
@@ -505,43 +504,20 @@ end
 
 # (mleft × nleft) = (mleft × ks) * (ks × nleft)
 # Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-function cleanup_tiling_microkernel!(C, A::FA, B::FA, α, β, i, j, p₁, p₂, mleft, nleft)
-    if iszero(β)
-        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
-            end
-            C[î, ĵ] = α * ABîĵ
-        end
-    else
-        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
-            end
-            Cîĵ = C[î, ĵ]
-            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
-        end
-    end
-    return nothing
-end
-
-# fallback: @avx miss compiles non-unit stride matrix
 function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
     if iszero(β)
-        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
             for p̂ in p₁:p₂
-                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
+                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
             end
             C[î, ĵ] = α * ABîĵ
         end
     else
-        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
+        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
             ABîĵ = zero(eltype(C))
             for p̂ in p₁:p₂
-                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
+                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
             end
             Cîĵ = C[î, ĵ]
             C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
