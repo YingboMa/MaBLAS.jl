@@ -385,6 +385,7 @@ Ĉ[1:micro_m, 1:micro_n] = α * Â[1:micro_m, 1:ps] * B̂[1:ps, 1:micro_n] + �
 ```
 where ``{⋅̂}`` denotes the matrix with offset.
 """
+#=
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
     N′ = VectorizationBase.pick_vector_width(T)
@@ -497,6 +498,113 @@ where ``{⋅̂}`` denotes the matrix with offset.
     return expr
 end
 #TODO: (A'B), AB', and A'B'
+=#
+
+tropical_fma(a, b, c) = max(a + b, c)
+@generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
+                                 Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+    N′ = VectorizationBase.pick_vector_width(T)
+    mregister′, remainder = divrem(micro_m, N′)
+    mregister, N = remainder == 0 ? (mregister′, N′) : (1, remainder)
+    V = SVec{N,T}
+    unroll = 4
+    matA = ndims(A) == 2
+    matB = ndims(B) == 2
+
+    kernel_code = quote
+        # tell the compiler that 1:ps is nonempty
+        ps < 1 && return nothing
+        st = sizeof(T)
+        sc1 = _stride(C, 1) * st
+        sc2 = _stride(C, 2) * st
+        if $matA # A is not packed
+            sa1 = _stride(A, 1) * st
+            sa2 = _stride(A, 2) * st
+        end
+        if $matB # B is not packed
+            sb1 = _stride(B, 1) * st
+            sb2 = _stride(B, 2) * st
+        end
+
+        ptrĈ = _pointer(C) + Coffset * st
+        ptrÂ = _pointer(A) + Aoffset * st
+        ptrB̂ = _pointer(B) + Boffset * st
+
+        # prefetch C matrix
+        # TODO
+        @nexprs $micro_n n̂ -> begin
+            prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
+        end
+
+        # intializing AB registers
+        @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
+        punroll, pleft = divrem(ps, $unroll)
+        # rank-1 updates
+        for _ in 1:punroll
+            @nexprs $unroll u -> begin
+                #TODO
+                if !$matA
+                    u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
+                    u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $micro_n)
+                end
+                ## unroll variable: u
+                @nexprs $mregister m̂ -> begin
+                    # assumption: A has unit leading stride, sa1 == 1
+                    ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $micro_m * st)
+                    A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st)
+                end
+                @nexprs $micro_n n̂ -> begin
+                    ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $micro_n * st)
+                    B_n̂ = $V(unsafe_load(ptrB′))
+                    @nexprs $mregister m̂ -> begin
+                        AB_m̂_n̂ = tropical_fma(A_m̂, B_n̂, AB_m̂_n̂)
+                    end
+                end
+            end
+            ptrÂ += $matA ? $unroll * sa2 : $unroll * $micro_m * st
+            ptrB̂ += $matB ? $unroll * sb1 : $unroll * $micro_n * st
+        end
+
+        for _ in 1:pleft
+            prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
+            @nexprs $mregister m̂ -> begin
+                # assumption: A has unit leading stride
+                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st)
+            end
+            @nexprs $micro_n n̂ -> begin
+                if $matB
+                    B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * sb2))
+                else
+                    B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
+                end
+                @nexprs $mregister m̂ -> begin
+                    AB_m̂_n̂ = tropical_fma(A_m̂, B_n̂, AB_m̂_n̂)
+                end
+            end
+            ptrÂ += $matA ? sa2 : $micro_m * st
+            ptrB̂ += $matB ? sb1 : $micro_n * st
+        end
+
+        _α = $V(α)
+        _β = $V(β)
+        @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
+            addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
+            C_m̂_n̂ = _β + vload($V, addr) # * -> +
+            C_m̂_n̂ = tropical_fma(_α, AB_m̂_n̂, C_m̂_n̂)
+            vstore!(addr, C_m̂_n̂)
+        end
+
+        return nothing
+    end
+
+    expr = quote
+        @inbounds begin
+            $(Expr(:meta,:noinline))
+            $kernel_code
+        end
+    end
+    return expr
+end
 
 ###
 ### Clean up loops
