@@ -351,7 +351,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}, ::Tuple{Val{fullmicro_m},Val{fullmicro_n}},
                                  mask) where {T,micro_m,micro_n,fullmicro_m,fullmicro_n}
     N = VectorizationBase.pick_vector_width(T)
-    mregister = micro_m ÷ N
+    mregister = max(1, micro_m ÷ N)
     V = SVec{N,T}
     unroll = 4
     matA = ndims(A) == 2
