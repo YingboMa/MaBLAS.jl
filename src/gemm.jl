@@ -138,139 +138,65 @@ end
 ### Macro kernel
 ###
 
-"""
-Example: decompose_to_microkernels(4, 8, 6) gives
-8 x 6 [2 x 6] ymm # without mask
-8 x 6 [2 x 6] ymm # with mask
-4 x 6 [1 x 6] ymm # with mask
+@generated function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, cacheis, cacheps, cachejs, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+    N = VectorizationBase.pick_vector_width(eltype(C))
+    micro_m % N == 0 || error("`micro_m` must be an integer multiple of vector register width for efficient microkernel generation, got width = $N, micro_m = $micro_m.")
+    mregister = max(1, micro_m ÷ N)
 
-8 x 4 [2 x 4] ymm # without mask
-8 x 4 [2 x 4] ymm # with mask
-4 x 4 [1 x 4] ymm # with mask
-
-8 x 2 [2 x 2] ymm # without mask
-8 x 2 [2 x 2] ymm # with mask
-4 x 2 [1 x 2] ymm # with mask
-
-8 x 1 [2 x 1] ymm # without mask
-8 x 1 [2 x 1] ymm # with mask
-4 x 1 [1 x 1] xmm # with mask
-"""
-function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{8},Val{6}}) where {packa,packb}
-    ps = cachep₂ - cachep₁ + 1
-    micro_m, micro_n = 8, 6
-    cs1, cs2 = _strides(C)
-    as1, as2 = _strides(A)
-    bs1, bs2 = _strides(B)
-    jj = cachej₁
-    Aoffset = packa ? 0 : (cachep₁ - 1) * as2
-    Boffset = packb ? 0 : (cachep₁ - 1) * bs1
-
-    n′ = 6
-    while (n = cachej₂ - jj + 1) >= n′
+    mloopexpr = quote
         ii = cachei₁
-        while (m = cachei₂ - ii + 1) >= 8
+        m′ = micro_m
+        while (m = cachei₂ - ii + 1) >= micro_m
             Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
             Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
-            Boffset′ = Boffset + (packb ? (jj - cachej₁) * ps : (jj - 1) * bs2)
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
-            ii += 8
+            Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, nothing) # no mask
+            ii += m′
         end
         m = cachei₂ - ii + 1
         mask = VectorizationBase.mask(eltype(C), m)
         Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
         Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
-        Boffset′ = Boffset + (packb ? (jj - cachej₁) * ps : (jj - 1) * bs2)
-        if m > 4
-            # do 8 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
-        elseif m > 0
-            # do 4 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
-        end
-        jj += micro_n
-    end # full n
-    jjfull = jj
-
-    off = 0
-    n′ = 4
-    if (n = cachej₂ - jj + 1) >= n′
-        ii = cachei₁
-        while (m = cachei₂ - ii + 1) >= 8
-            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
-            Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
-            Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
-            ii += 8
-        end
-        m = cachei₂ - ii + 1
-        mask = VectorizationBase.mask(eltype(C), m)
-        Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
-        Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
-        Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
-        if m > 4
-            # do 8 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
-        elseif m > 0
-            # do 4 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
+        Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
+        @nexprs $mregister midx -> begin
+            m′ = micro_m - (midx - 1) * $N
+            if m > m′ - $N
+                microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, mask) # mask
+            end
         end
         jj += n′
-        off += n′
-    end # full n
+    end
 
-    n′ = 2
-    if (n = cachej₂ - jj + 1) >= n′
-        ii = cachei₁
-        while (m = cachei₂ - ii + 1) >= 8
-            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
-            Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
-            Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
-            ii += 8
-        end
-        m = cachei₂ - ii + 1
-        mask = VectorizationBase.mask(eltype(C), m)
-        Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
-        Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
-        Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
-        if m > 4
-            # do 8 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
-        elseif m > 0
-            # do 4 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
-        end
-        jj += n′
-        off += n′
-    end # full n
+    nloopexpr = quote
+        cachei₁, cachei₂ = cacheis
+        cachep₁, cachep₂ = cacheps
+        cachej₁, cachej₂ = cachejs
+        ps = cachep₂ - cachep₁ + 1
+        cs1, cs2 = _strides(C)
+        as1, as2 = _strides(A)
+        bs1, bs2 = _strides(B)
+        jj = jjfull = cachej₁
+        micro_n_offset = 0
+        Aoffset = packa ? 0 : (cachep₁ - 1) * as2
+        Boffset = packb ? 0 : (cachep₁ - 1) * bs1
 
-    n′ = 1
-    if (n = cachej₂ - jj + 1) >= n′
-        ii = cachei₁
-        while (m = cachei₂ - ii + 1) >= 8
-            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
-            Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
-            Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
-            ii += 8
+        @nexprs $micro_n nidx -> begin
+            n′ = micro_n - nidx + 1
+            if nidx == 1 # hot loop
+                while (n = cachej₂ - jj + 1) >= n′
+                    $mloopexpr
+                    jjfull = jj
+                end # full n
+                jjfull = jj # set `jjfull` after completing a full `micro_n`
+            else # cleanup loop
+                if (n = cachej₂ - jj + 1) >= n′
+                    $mloopexpr
+                    micro_n_offset += n′
+                end
+            end
         end
-        m = cachei₂ - ii + 1
-        mask = VectorizationBase.mask(eltype(C), m)
-        Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
-        Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
-        Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
-        if m > 4
-            # do 8 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
-        elseif m > 0
-            # do 4 with mask
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
-        end
-        jj += n′
-        off += n′
-    end # full n
-    return nothing
+    end
+    return nloopexpr
 end
 
 ###
