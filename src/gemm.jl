@@ -193,8 +193,34 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tupl
     jjfull = jj
 
     off = 0
-    n′ = 3
-    while (n = cachej₂ - jj + 1) >= n′
+    n′ = 4
+    if (n = cachej₂ - jj + 1) >= n′
+        ii = cachei₁
+        while (m = cachei₂ - ii + 1) >= 8
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
+            Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
+            ii += 8
+        end
+        m = cachei₂ - ii + 1
+        mask = VectorizationBase.mask(eltype(C), m)
+        Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+        Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1          )
+        Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + off : (jj - 1) * bs2)
+        if m > 4
+            # do 8 with mask
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
+        elseif m > 0
+            # do 4 with mask
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
+        end
+        jj += n′
+        off += n′
+    end # full n
+
+    n′ = 2
+    if (n = cachej₂ - jj + 1) >= n′
         ii = cachei₁
         while (m = cachei₂ - ii + 1) >= 8
             Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
@@ -220,7 +246,7 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tupl
     end # full n
 
     n′ = 1
-    while (n = cachej₂ - jj + 1) >= n′
+    if (n = cachej₂ - jj + 1) >= n′
         ii = cachei₁
         while (m = cachei₂ - ii + 1) >= 8
             Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
