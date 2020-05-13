@@ -99,30 +99,26 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
         as1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
     m, k, n = checkmulsize(C, A, B)
+    if !packa && !packb
+        macrokernel!(C, nothing, A, A, B, B, α, β, packing, (1, m), (1, k), (1, n), kernel_params)
+        return C
+    end
 
     cache_k = partition_k(k, cache_k) # More evenly divide K
 
-    if packa || packb
-        # get buffer
-        Abuffersize = cache_m * cache_k
-        Bbuffersize = cache_k * cache_n
-        ABbuffersize = micro_m * micro_n
-        T = eltype(C)
-        buffer = N_THREADS_BUFFERS[Threads.threadid()]
-        resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
-        ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
-        Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
-        ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
-        Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
-        ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
-        ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
-    else
-        Abuffer = A
-        Bbuffer = B
-        ABbuffer = nothing
-    end
-
-    # A (m × k), B (k × n)
+    # get buffer
+    Abuffersize = cache_m * cache_k
+    Bbuffersize = cache_k * cache_n
+    ABbuffersize = micro_m * micro_n
+    T = eltype(C)
+    buffer = N_THREADS_BUFFERS[Threads.threadid()]
+    resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
+    ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
+    Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
+    ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
+    Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
+    ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
+    ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
