@@ -142,38 +142,136 @@ end
 ### Macro kernel
 ###
 
-function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+"""
+Example: decompose_to_microkernels(4, 8, 6) gives
+8 x 6 [2 x 6] ymm # without mask
+8 x 6 [2 x 6] ymm # with mask
+4 x 6 [1 x 6] ymm # with mask
+
+8 x 4 [2 x 4] ymm # without mask
+8 x 4 [2 x 4] ymm # with mask
+4 x 4 [1 x 4] ymm # with mask
+
+8 x 2 [2 x 2] ymm # without mask
+8 x 2 [2 x 2] ymm # with mask
+4 x 2 [1 x 2] ymm # with mask
+
+8 x 1 [2 x 1] ymm # without mask
+8 x 1 [2 x 1] ymm # with mask
+4 x 1 [1 x 1] xmm # with mask
+"""
+function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params::Tuple{Val{8},Val{6}}) where {packa,packb}
     ps = cachep₂ - cachep₁ + 1
+    #=
     for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
         for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
             Coffset = (microi₁ - 1) * _stride(C, 1) + (microj₁ - 1) * _stride(C, 2)
             Aoffset = packa ? (microi₁ - cachei₁) * ps :
-            (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
+                (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
             Boffset = packb ? (microj₁ - cachej₁) * ps :
-            (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
+                              (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
 
-            if nleft == micro_n && #= very very very very very hacky=# mleft > VectorizationBase.pick_vector_width(eltype(C))
-                # (micro_m × ks) * (ks × micro_n)
-                # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                #microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params)
-                if mleft == micro_m
-                    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, mleft, ps, nleft, kernel_params, Val(false))
-                else
-                    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, mleft, ps, nleft, kernel_params, Val(true))
-                end
-            else
-                if packa && packb
-                    # microkernel writes to the `AB` buffer
-                    microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, mleft, ps, nleft, kernel_params, Val(false))
-                    # copy the `AB` buffer to `C` with `β` scaling
-                    # Ĉ = AB[1:mleft, 1:nleft]
-                    cleanup_packing!(C, ABbuffer, β, (microi₁ - 1, microj₁ - 1), mleft, nleft)
-                else
-                    cleanup_tiling_microkernel!(C, A, B, α, β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
-                end
-            end
+
         end # microi
     end # microj
+    =#
+    micro_m, micro_n = 8, 6
+    cs1, cs2 = _strides(C)
+    as1, as2 = _strides(A)
+    bs1, bs2 = _strides(B)
+    jj = cachej₁
+
+    n′ = 6
+    while (n = cachej₂ - jj + 1) >= n′
+        ii = cachei₁
+        while (m = cachei₂ - ii + 1) >= 8
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jj - cachej₁) * ps : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
+            ii += 8
+        end
+        m = cachei₂ - ii + 1
+        mask = VectorizationBase.mask(eltype(C), m)
+        if m > 4
+            # do 8 with mask
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jj - cachej₁) * ps : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
+        elseif m > 0
+            # do 4 with mask
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jj - cachej₁) * ps : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
+        end
+        jj += micro_n
+    end # full n
+    jjfull = jj
+
+    #=
+    n′ = 3
+    while (n = cachej₂ - jj + 1) >= n′
+        ii = cachei₁
+        while (m = cachei₂ - ii + 1) >= 8
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jjfull - cachej₁) * ps : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(8), Val(n′), nfullval), nothing) # no mask
+            ii += 8
+        end
+        m = cachei₂ - ii + 1
+        mask = VectorizationBase.mask(eltype(C), m)
+        if m > 4
+            # do 8 with mask
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jjfull - cachej₁) * ps : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(8), Val(n′), nfullval), mask) # mask
+        elseif m > 0
+            # do 4 with mask
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jjfull - cachej₁) * ps : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(4), Val(n′), nfullval), mask) # mask
+        end
+        jj += n′
+        jjfull += micro_n
+    end # full n
+    =#
+
+    n′ = 1
+    off = 0
+    while (n = cachej₂ - jj + 1) >= n′
+        ii = cachei₁
+        while (m = cachei₂ - ii + 1) >= 8
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jjfull - cachej₁) * ps + off : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(8), Val(n′)), kernel_params, nothing) # no mask
+            ii += 8
+        end
+        m = cachei₂ - ii + 1
+        mask = VectorizationBase.mask(eltype(C), m)
+        if m > 4
+            # do 8 with mask
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jjfull - cachej₁) * ps + off : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(8), Val(n′)), kernel_params, mask) # mask
+        elseif m > 0
+            # do 4 with mask
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset = packa ? (ii - cachei₁) * ps : (ii - 1) * as1 + (cachep₁ - 1) * as2
+            Boffset = packb ? (jjfull - cachej₁) * ps + off : (cachep₁ - 1) * bs1 + (jj - 1) * bs2
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, (Val(4), Val(n′)), kernel_params, mask) # mask
+        end
+        jj += n′
+        #jjfull += 1
+        off += n′
+    end # full n
+    return nothing
 end
 
 ###
@@ -241,144 +339,8 @@ end
 ###
 
 """
-    decompose_to_microkernels(width, micro_m, micro_n)
-
-Example: decompose_to_microkernels(4, 8, 6) gives
-8 x 6 [2 x 6] ymm
-4 x 6 [1 x 6] ymm
-2 x 6 [1 x 6] xmm
-1 x 6 [1 x 6] xmm
-
-8 x 4 [2 x 6] ymm
-4 x 4 [1 x 6] ymm
-2 x 4 [1 x 6] xmm
-1 x 4 [1 x 6] xmm
-
-8 x 2 [2 x 3] ymm
-4 x 2 [1 x 3] ymm
-2 x 2 [1 x 3] xmm
-1 x 2 [1 x 3] xmm
-
-8 x 1 [2 x 1] ymm
-4 x 1 [1 x 1] ymm
-2 x 1 [1 x 1] xmm
-1 x 1 [1 x 1] xmm
-"""
-function decompose_to_microkernels(width, micro_m, micro_n; maxiters=50)
-    micro_m′ = micro_m
-    micro_n′ = micro_n
-    width′ = width
-    maxiters′ = maxiters
-
-    mvals = Int[]
-    nvals = Int[]
-    while micro_m′ > 1
-        push!(mvals, micro_m′)
-        micro_m′ = micro_m′ - width′
-        micro_m′ == width′ && ( width′ >>= 1 )
-        maxiters <= 0 && @goto ERROR
-        maxiters -= 1
-    end
-    push!(mvals, micro_m′)
-
-    while micro_n′ >= 1
-        push!(nvals, micro_n′)
-        width′ = width
-        micro_n′ = micro_n′ - 2
-        micro_m′ = micro_m
-        maxiters <= 0 && @goto ERROR
-        maxiters -= 1
-    end
-    nvals[end] != 1 && push!(nvals, 1)
-    return mvals, nvals
-    @label ERROR
-    error("Kernel partition did not terminate in maxiters=$maxiters′ iterations.")
-end
-
-#=
-"""
-    microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, m, n, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
-
-It invokes a sequence of kernels that computes
-```julia
-Ĉ[1:m, 1:n] = Â[1:m, 1:ps] * B̂[1:ps, 1:n]
-```
-in the speed of light, where ``{⋅̂}`` denotes the matrix with offset.
-"""
-@generated function microkernels!(C, A, B, α, β,
-                                  Coffset, Aoffset, Boffset,
-                                  ps, m, n, packing::Tuple{Val{packa},Val{packb}},
-                                  kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
-    msizes, nsizes = decompose_to_microkernels(eltype(C), micro_m, micro_n)
-    T = eltype(C)
-    quote
-        if packa
-        else
-        end
-        if packb
-        else
-        end
-        $([:(while n >= $n′
-                 i = m
-                 Coffset′, Aoffset′, Boffset′ = Coffset, Aoffset, Boffset
-                 $([:(begin
-                          while i >= $m′
-                              # compute for mxn
-                              microkernel!(C, A, B, α, β,
-                                           Coffset′, Aoffset′, Boffset′, ps,
-                                           (Val($m′), Val($n′)))
-                              i -= $m′
-                          end
-                          Coffset′ += m′
-                      end) for m′ in msizes]...)
-                 n -= $n′
-             end) for n′ in nsizes]...)
-    end
-end
-=#
-
-# 8 x 6 # kernel size
-# ([8, 4, 2, 1], [6, 4, 2, 1])
-#
-# kernels list:
-# m x n
-# 8 x 6: 1 # hot kernel
-# 4 x 6: 2
-# 2 x 6
-# 1 x 6
-#
-# 8 x 4: 3
-# 4 x 4: 4
-# 2 x 4
-# 1 x 4
-#
-# 8 x 2
-# 4 x 2
-# 2 x 2
-# 1 x 2
-#
-# 8 x 1
-# 4 x 1
-# 2 x 1
-# 1 x 1
-#
-#    1 2 3 4 5 6 7 8 9 10
-# 1  x x x x x x x x x x
-# 2  x x x x x x x x x x
-# 3  x x x x x x x x x x
-# 4  x x x x x x x x x x
-# 5  x x x x x x x x x x
-# 6  x x x x x x x x x x
-# 7  x x x x x x x x x x
-# 8  x x x x x 1 x x x 3
-# 9  x x x x x x x x x x
-# 10 x x x x x x x x x x
-# 11 x x x x x x x x x x
-# 12 x x x x x 2 x x x 4
-
-"""
-    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, m, ps, n,
-        kernel_params::Tuple{Val{micro_m},Val{micro_n}}, Val{usemask}) where {micro_m,micro_n,usemask}
+    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, m, ps,
+        kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
 
 A kernel that computes
 ```julia
@@ -387,14 +349,15 @@ Ĉ[1:m, 1:n] = α * Â[1:m, 1:ps] * B̂[1:ps, 1:n] + β * Ĉ[1:m, 1:n]
 where ``{⋅̂}`` denotes the matrix with offset.
 """
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
-                                 Coffset, Aoffset, Boffset, m, ps, n, # TODO: handle `n`
-                                 ::Tuple{Val{micro_m},Val{micro_n}}, ::Val{usemask}) where {T,micro_m,micro_n,usemask}
+                                 Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}, ::Tuple{Val{fullmicro_m},Val{fullmicro_n}},
+                                 mask) where {T,micro_m,micro_n,fullmicro_m,fullmicro_n}
     N = VectorizationBase.pick_vector_width(T)
     mregister = micro_m ÷ N
     V = SVec{N,T}
     unroll = 4
     matA = ndims(A) == 2
     matB = ndims(B) == 2
+    usemask = mask != Nothing
 
     kernel_code = quote
         # tell the compiler that the iteration is nonempty
@@ -412,8 +375,8 @@ where ``{⋅̂}`` denotes the matrix with offset.
             sb2 = _stride(B, 2) * st
         end
         @nexprs $mregister m̂ -> begin
-            mask_m̂ = (usemask && m̂ == $mregister) ? VectorizationBase.mask(Val($N), m - micro_m) : # nontrival mask
-                                                    VectorizationBase.mask(Val($N), $N) # trival mask that should be optimized away
+            mask_m̂ = ($usemask && m̂ == $mregister) ? mask : # nontrival mask
+                                                    VectorizationBase.max_mask(T) # trival mask that should be optimized away
         end
 
         ptrĈ = _pointer(C) + Coffset * st
@@ -428,6 +391,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
 
         # intializing AB registers
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
+        #=
         punroll, pleft = divrem(ps, $unroll)
 
         # tell the compiler that the iteration is nonempty
@@ -438,8 +402,8 @@ where ``{⋅̂}`` denotes the matrix with offset.
             @nexprs $unroll u -> begin
                 #TODO
                 if !$matA
-                    u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
-                    u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $micro_n)
+                    u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $fullmicro_n)
+                    u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $fullmicro_n)
                 end
                 ## unroll variable: u
                 @nexprs $mregister m̂ -> begin
@@ -448,7 +412,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                     A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st, mask_m̂)
                 end
                 @nexprs $micro_n n̂ -> begin
-                    ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $micro_n * st)
+                    ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $fullmicro_n * st)
                     B_n̂ = $V(unsafe_load(ptrB′))
                     @nexprs $mregister m̂ -> begin
                         AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
@@ -456,11 +420,13 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 end
             end
             ptrÂ += $matA ? $unroll * sa2 : $unroll * $micro_m * st
-            ptrB̂ += $matB ? $unroll * sb1 : $unroll * $micro_n * st
+            ptrB̂ += $matB ? $unroll * sb1 : $unroll * $fullmicro_n * st
         end
 
         for _ in 1:pleft
-            prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
+        =#
+        for _ in 1:ps
+            prefetcht0(ptrÂ + 64 * $fullmicro_m + 2 * $fullmicro_n)
             @nexprs $mregister m̂ -> begin
                 # assumption: A has unit leading stride
                 A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st, mask_m̂)
@@ -475,8 +441,8 @@ where ``{⋅̂}`` denotes the matrix with offset.
                     AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
-            ptrÂ += $matA ? sa2 : $micro_m * st
-            ptrB̂ += $matB ? sb1 : $micro_n * st
+            ptrÂ += $matA ? sa2 : $fullmicro_m * st
+            ptrB̂ += $matB ? sb1 : $fullmicro_n * st
         end
 
         _α = $V(α)
@@ -570,7 +536,8 @@ end
 
 @inline _stride(A, n) = stride(A, n)
 @inline _pointer(A) = pointer(A)
-#@inline _stride(A::Union{Adjoint,Transpose}, n) = reverse(strides(parent(A)))[n]
+@inline _strides(A) = strides(A)
+@inline _strides(A::Union{Adjoint,Transpose}) = reverse(strides(parent(A)))
 #Not very safe, but okay
 @inline _stride(A::Union{Adjoint,Transpose}, n) = n == 1 ? stride(parent(A), 2) : stride(parent(A), 1)
 @inline _pointer(A::Union{Adjoint,Transpose}) = pointer(parent(A))
