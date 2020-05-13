@@ -52,6 +52,8 @@ end
 
 function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=(false, false))
     m, k, n = checkmulsize(C, A, B)
+    α = convert(eltype(C), α)
+    β = convert(eltype(C), β)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
         return fill!(C, zero(eltype(C)))
@@ -316,6 +318,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
 
         # intializing AB registers
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
+        #=
         punroll, pleft = divrem(ps, $unroll)
 
         # tell the compiler that the iteration is nonempty
@@ -339,7 +342,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                     ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $fullmicro_n * st)
                     B_n̂ = $V(unsafe_load(ptrB′))
                     @nexprs $mregister m̂ -> begin
-                        AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
+                        AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
                     end
                 end
             end
@@ -348,6 +351,8 @@ where ``{⋅̂}`` denotes the matrix with offset.
         end
 
         for _ in 1:pleft
+        =#
+        for _ in 1:ps
             prefetcht0(ptrÂ + 64 * $fullmicro_m + 2 * $fullmicro_n)
             @nexprs $mregister m̂ -> begin
                 # assumption: A has unit leading stride
@@ -360,7 +365,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                     B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
                 end
                 @nexprs $mregister m̂ -> begin
-                    AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
+                    AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
             ptrÂ += $matA ? sa2 : $fullmicro_m * st
@@ -378,7 +383,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
                 C_m̂_n̂ = _β * vload($V, addr, mask_m̂)
-                C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
+                C_m̂_n̂ = muladd(_α, AB_m̂_n̂, C_m̂_n̂)
                 vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         end
