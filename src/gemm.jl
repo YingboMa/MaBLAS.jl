@@ -152,19 +152,19 @@ function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tupl
             Boffset = packb ? (microj₁ - cachej₁) * ps :
             (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
 
-            #=
-            microkernels!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset,
-                          ps, mleft, nleft, packing, kernel_params)
-            =#
-            #microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, mleft, nleft, ps, kernel_params)
-            if nleft == micro_n && mleft == micro_m
+            if nleft == micro_n && #= very very very very very hacky=# mleft > VectorizationBase.pick_vector_width(eltype(C))
                 # (micro_m × ks) * (ks × micro_n)
                 # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params)
+                #microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params)
+                if mleft == micro_m
+                    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, mleft, ps, nleft, kernel_params, Val(false))
+                else
+                    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, mleft, ps, nleft, kernel_params, Val(true))
+                end
             else
                 if packa && packb
                     # microkernel writes to the `AB` buffer
-                    microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
+                    microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, mleft, ps, nleft, kernel_params, Val(false))
                     # copy the `AB` buffer to `C` with `β` scaling
                     # Ĉ = AB[1:mleft, 1:nleft]
                     cleanup_packing!(C, ABbuffer, β, (microi₁ - 1, microj₁ - 1), mleft, nleft)
@@ -377,27 +377,29 @@ end
 # 12 x x x x x 2 x x x 4
 
 """
-    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, ps, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, m, ps, n,
+        kernel_params::Tuple{Val{micro_m},Val{micro_n}}, Val{usemask}) where {micro_m,micro_n,usemask}
 
 A kernel that computes
 ```julia
-Ĉ[1:micro_m, 1:micro_n] = α * Â[1:micro_m, 1:ps] * B̂[1:ps, 1:micro_n] + β * Ĉ[1:micro_m, 1:micro_n]
+Ĉ[1:m, 1:n] = α * Â[1:m, 1:ps] * B̂[1:ps, 1:n] + β * Ĉ[1:m, 1:n]
 ```
 where ``{⋅̂}`` denotes the matrix with offset.
 """
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
-                                 Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
-    N′ = VectorizationBase.pick_vector_width(T)
-    mregister′, remainder = divrem(micro_m, N′)
-    mregister, N = remainder == 0 ? (mregister′, N′) : (1, remainder)
+                                 Coffset, Aoffset, Boffset, m, ps, n, # TODO: handle `n`
+                                 ::Tuple{Val{micro_m},Val{micro_n}}, ::Val{usemask}) where {T,micro_m,micro_n,usemask}
+    N = VectorizationBase.pick_vector_width(T)
+    mregister = micro_m ÷ N
     V = SVec{N,T}
     unroll = 4
     matA = ndims(A) == 2
     matB = ndims(B) == 2
 
     kernel_code = quote
-        # tell the compiler that 1:ps is nonempty
+        # tell the compiler that the iteration is nonempty
         ps < 1 && return nothing
+
         st = sizeof(T)
         sc1 = _stride(C, 1) * st
         sc2 = _stride(C, 2) * st
@@ -408,6 +410,10 @@ where ``{⋅̂}`` denotes the matrix with offset.
         if $matB # B is not packed
             sb1 = _stride(B, 1) * st
             sb2 = _stride(B, 2) * st
+        end
+        @nexprs $mregister m̂ -> begin
+            mask_m̂ = (usemask && m̂ == $mregister) ? VectorizationBase.mask(Val($N), m - micro_m) : # nontrival mask
+                                                    VectorizationBase.mask(Val($N), $N) # trival mask that should be optimized away
         end
 
         ptrĈ = _pointer(C) + Coffset * st
@@ -423,6 +429,10 @@ where ``{⋅̂}`` denotes the matrix with offset.
         # intializing AB registers
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
         punroll, pleft = divrem(ps, $unroll)
+
+        # tell the compiler that the iteration is nonempty
+        (punroll < 1 && pleft < 1) && return nothing
+
         # rank-1 updates
         for _ in 1:punroll
             @nexprs $unroll u -> begin
@@ -435,7 +445,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 @nexprs $mregister m̂ -> begin
                     # assumption: A has unit leading stride, sa1 == 1
                     ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $micro_m * st)
-                    A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st)
+                    A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st, mask_m̂)
                 end
                 @nexprs $micro_n n̂ -> begin
                     ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $micro_n * st)
@@ -453,7 +463,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
             prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
             @nexprs $mregister m̂ -> begin
                 # assumption: A has unit leading stride
-                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st)
+                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st, mask_m̂)
             end
             @nexprs $micro_n n̂ -> begin
                 if $matB
@@ -473,15 +483,15 @@ where ``{⋅̂}`` denotes the matrix with offset.
         if iszero(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 C_m̂_n̂ = _α * AB_m̂_n̂
-                vstore!(ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2, C_m̂_n̂)
+                vstore!(ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2, C_m̂_n̂, mask_m̂)
             end
         else
             _β = $V(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
-                C_m̂_n̂ = _β * vload($V, addr)
+                C_m̂_n̂ = _β * vload($V, addr, mask_m̂)
                 C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
-                vstore!(addr, C_m̂_n̂)
+                vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         end
 
