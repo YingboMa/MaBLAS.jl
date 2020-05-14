@@ -8,12 +8,14 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
 SIMDPirates = "21efa798-c60a-11e8-04d3-e1a92915a26a"
 TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
+UnPack = "3a884ed6-31ef-47d7-9d2a-63182c4928ed"
 VectorizationBase = "3d5dd08c-fd9d-11e8-17fa-ed2836048c2f"
 
 [compat]
 LoopVectorization = "0.7.8,0.8"
 SIMDPirates = "0.7.23"
 TimerOutputs = "0.5.5"
+UnPack = "0,1"
 VectorizationBase = "0.11.3"
 julia = "1.0"
 

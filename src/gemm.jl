@@ -6,6 +6,7 @@ using LoopVectorization: @avx
 using SIMDPirates: vfmadd231
 using VectorizationBase: VectorizationBase
 using TimerOutputs: TimerOutputs, @timeit_debug, TimerOutput
+using UnPack: @unpack
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -51,7 +52,7 @@ end
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=(false, false))
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=nothing)
     m, k, n = checkmulsize(C, A, B)
     α = convert(eltype(C), α)
     β = convert(eltype(C), β)
@@ -69,7 +70,8 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
         end
         return C
     end
-    # packing strategy
+    # TODO: packing strategy
+    packing === nothing && (packing = (false, false))
     packa, packb = packing
     if packa isa Bool && packb isa Bool
         if packa # manual union split
@@ -97,17 +99,32 @@ partition_k(k, cache_k) = cld(k, cld(k, cache_k))
 ### Lower-level `_mul!`
 ###
 
+# use lowercase here because these are not actually types
+struct GemmContext{packa,packb,micro_m,micro_n}
+    cache_m::Int
+    cache_k::Int
+    cache_n::Int
+    cs1::Int
+    cs2::Int
+    as1::Int
+    as2::Int
+    bs1::Int
+    bs2::Int
+end
+
 function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
-    cs1 = _stride(C, 1)
-    as1 = _stride(A, 1)
-    bs1 = _stride(B, 1)
+    cs1, cs2 = _strides(C)
+    as1, as2 = _strides(A)
+    bs1, bs2 = _strides(B)
     cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
     if !packa
         as1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
+    ctx = GemmContext{packa,packb,micro_m,micro_n}(cache_m, cache_k, cache_n,
+                                                   cs1, cs2, as1, as2, bs1, bs2)
     m, k, n = checkmulsize(C, A, B)
     if !packa && !packb
-        macrokernel!(C, A, A, B, B, α, β, packing, (1, m), (1, k), (1, n), kernel_params)
+        macrokernel!(C, A, B, α, β, (1, m), (1, k), (1, n), ctx)
         return C
     end
 
@@ -120,9 +137,9 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
     buffer = N_THREADS_BUFFERS[Threads.threadid()]
     resize!(buffer, (Abuffersize + Bbuffersize) * sizeof(T) + 2PAGE_SIZE)
     ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
-    Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
+    Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : canonicalize(A)
     ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
-    Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
+    Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : canonicalize(B)
     ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
@@ -132,7 +149,7 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
-                macrokernel!(C, A, Abuffer, B, Bbuffer, α, β′, packing, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params)
+                macrokernel!(C, Abuffer, Bbuffer, α, β′, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), ctx)
             end # cachei
         end # cachep
     end # cachej
@@ -143,8 +160,9 @@ end
 ### Macro kernel
 ###
 
-@generated function macrokernel!(C, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, cacheis, cacheps, cachejs, kernel_params::Tuple{Val{micro_m},Val{micro_n}})::Nothing where {packa,packb,micro_m,micro_n}
-    N = VectorizationBase.pick_vector_width(eltype(C))
+@generated function macrokernel!(C, A, B, α, β, cacheis, cacheps, cachejs, ctx::GemmContext{packa,packb,micro_m,micro_n})::Nothing where {packa,packb,micro_m,micro_n}
+    T = eltype(C)
+    N = VectorizationBase.pick_vector_width(T)
     micro_m % N == 0 || error("`micro_m` must be an integer multiple of vector register width for efficient microkernel generation, got width = $N, micro_m = $micro_m.")
     mregister = max(1, micro_m ÷ N)
 
@@ -155,18 +173,18 @@ end
             Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
             Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
             Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, Val(4), nothing) # no mask
+            microkernel!(C, A, B, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), Val(4), nothing, ctx) # no mask
             ii += m′
         end
         m = cachei₂ - ii + 1
-        mask = VectorizationBase.mask(eltype(C), m)
+        mask = VectorizationBase.mask($T, m)
         Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
         Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
         Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
         @nif $(mregister+1) midx -> begin
             (m > (m′ = $micro_m - (midx - 1) * $N) - $N)
         end midx -> begin
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, Val(1), mask)
+            microkernel!(C, A, B, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), Val(1), mask, ctx) # mask
         end midx -> nothing
         jj += n′
     end
@@ -176,9 +194,7 @@ end
         cachep₁, cachep₂ = cacheps
         cachej₁, cachej₂ = cachejs
         ps = cachep₂ - cachep₁ + 1
-        cs1, cs2 = _strides(C)
-        as1, as2 = _strides(A)
-        bs1, bs2 = _strides(B)
+        @unpack cs1, cs2, as1, as2, bs1, bs2 = ctx
         jj = jjfull = cachej₁
         micro_n_offset = 0
         Aoffset = packa ? 0 : (cachep₁ - 1) * as2
@@ -279,17 +295,19 @@ Ĉ[1:m, 1:n] = α * Â[1:m, 1:ps] * B̂[1:ps, 1:n] + β * Ĉ[1:m, 1:n]
 ```
 where ``{⋅̂}`` denotes the matrix with offset.
 """
-@generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
-                                 Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}, ::Tuple{Val{fullmicro_m},Val{fullmicro_n}},
-                                 ::Val{unroll}, mask)::Nothing where {T,micro_m,micro_n,fullmicro_m,fullmicro_n,unroll}
+@generated function microkernel!(C, A, B, α, β, Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}},::Val{unroll}, mask,
+                                 ctx::GemmContext{packa,packb,fullmicro_m,fullmicro_n})::Nothing where {micro_m,micro_n,unroll,packa,packb,fullmicro_m,fullmicro_n}
+    T = eltype(C)
+    TA = eltype(A)
+    TB = eltype(B)
+    T === TA === TB || throw(ArgumentError("eltype(C) === eltype(A) === eltype(B) must hold in the microkernel! Got eltype(C) = $T, eltype(A) = $TA, eltype(B) = $TB."))
     N = VectorizationBase.pick_vector_width(T)
     mregister = max(1, micro_m ÷ N)
     V = SVec{N,T}
     dounroll = unroll > 1
-    matA = ndims(A) == 2
-    matB = ndims(B) == 2
+    matA = !packa
+    matB = !packb
     usemask = mask != Nothing
-
 
     nounroll_loopexpr = quote
         prefetcht0(ptrÂ + 64 * $fullmicro_m + 2 * $fullmicro_n)
@@ -299,7 +317,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
         end
         @nexprs $micro_n n̂ -> begin
             if $matB
-                B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * sb2))
+                B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * bs2))
             else
                 B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
             end
@@ -307,8 +325,8 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
             end
         end
-        ptrÂ += $matA ? sa2 : $fullmicro_m * st
-        ptrB̂ += $matB ? sb1 : $fullmicro_n * st
+        ptrÂ += $matA ? as2 : $fullmicro_m * st
+        ptrB̂ += $matB ? bs1 : $fullmicro_n * st
     end
 
     unroll_loopexpr = quote
@@ -320,42 +338,40 @@ where ``{⋅̂}`` denotes the matrix with offset.
             end
             ## unroll variable: u
             @nexprs $mregister m̂ -> begin
-                # assumption: A has unit leading stride, sa1 == 1
-                ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $fullmicro_m * st)
+                # assumption: A has unit leading stride, as1 == 1
+                ptrA′ = ptrÂ + (u - 1) * ($matA ? as2 : $fullmicro_m * st)
                 A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st, mask_m̂)
             end
             @nexprs $micro_n n̂ -> begin
-                ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $fullmicro_n * st)
+                ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? bs2 : st) + (u - 1) * ($matB ? bs1 : $fullmicro_n * st)
                 B_n̂ = $V(unsafe_load(ptrB′))
                 @nexprs $mregister m̂ -> begin
                     AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
         end
-        ptrÂ += $matA ? $unroll * sa2 : $unroll * $fullmicro_m * st
-        ptrB̂ += $matB ? $unroll * sb1 : $unroll * $fullmicro_n * st
+        ptrÂ += $matA ? $unroll * as2 : $unroll * $fullmicro_m * st
+        ptrB̂ += $matB ? $unroll * bs1 : $unroll * $fullmicro_n * st
     end
 
     kernel_code = quote
         # tell the compiler that the iteration is nonempty
         ps < 1 && return nothing
 
-        st = sizeof(T)
-        sc1, sc2 = _strides(C)
-        sc1, sc2 = sc1 * st, sc2 * st
+        st = sizeof($T)
+        cs1 = ctx.cs1 * st
+        cs2 = ctx.cs2 * st
         if $matA # A is not packed
-            sa1, sa2 = _strides(A)
-            sa1 = sa1 * st
-            sa2 = sa2 * st
+            as1 = ctx.as1 * st
+            as2 = ctx.as2 * st
         end
         if $matB # B is not packed
-            sb1, sb2 = _strides(B)
-            sb1 = sb1 * st
-            sb2 = sb2 * st
+            bs1 = ctx.bs1 * st
+            bs2 = ctx.bs2 * st
         end
         @nexprs $mregister m̂ -> begin
             mask_m̂ = ($usemask && m̂ == $mregister) ? mask : # nontrival mask
-                                                    VectorizationBase.max_mask(T) # trival mask that should be optimized away
+                                                     VectorizationBase.max_mask($T) # trival mask that should be optimized away
         end
 
         ptrĈ = _pointer(C) + Coffset * st
@@ -364,7 +380,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
 
         # prefetch C matrix
         @nexprs $micro_n n̂ -> begin
-            prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
+            prefetcht0(ptrĈ + (n̂ - 1) * cs2 + 7 * 8)
         end
 
         # intializing AB registers
@@ -395,13 +411,13 @@ where ``{⋅̂}`` denotes the matrix with offset.
 
         if iszero(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
-                addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
+                addr = ptrĈ + (m̂ - 1) * $N * cs1 + (n̂ - 1) * cs2
                 vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         else
             _β = $V(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
-                addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
+                addr = ptrĈ + (m̂ - 1) * $N * cs1 + (n̂ - 1) * cs2
                 C_m̂_n̂ = vfmadd231(_β, vload($V, addr, mask_m̂), C_m̂_n̂)
                 vstore!(addr, C_m̂_n̂, mask_m̂)
             end
@@ -437,6 +453,9 @@ end
 #Not very safe, but okay
 @inline _stride(A::Union{Adjoint,Transpose}, n) = n == 1 ? stride(parent(A), 2) : stride(parent(A), 1)
 @inline _pointer(A::Union{Adjoint,Transpose}) = pointer(parent(A))
+
+canonicalize(A) = A
+canonicalize(A::Union{Adjoint,Transpose}) = canonicalize(parent(A))
 
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
