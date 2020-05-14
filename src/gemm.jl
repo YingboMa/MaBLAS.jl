@@ -142,7 +142,7 @@ end
 ### Macro kernel
 ###
 
-@generated function macrokernel!(C, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, cacheis, cacheps, cachejs, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+@generated function macrokernel!(C, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, cacheis, cacheps, cachejs, kernel_params::Tuple{Val{micro_m},Val{micro_n}})::Nothing where {packa,packb,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(eltype(C))
     micro_m % N == 0 || error("`micro_m` must be an integer multiple of vector register width for efficient microkernel generation, got width = $N, micro_m = $micro_m.")
     mregister = max(1, micro_m ÷ N)
@@ -199,6 +199,7 @@ end
                 end
             end
         end
+        return nothing
     end
     return nloopexpr
 end
@@ -279,7 +280,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
 """
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}, ::Tuple{Val{fullmicro_m},Val{fullmicro_n}},
-                                 ::Val{unroll}, mask) where {T,micro_m,micro_n,fullmicro_m,fullmicro_n,unroll}
+                                 ::Val{unroll}, mask)::Nothing where {T,micro_m,micro_n,fullmicro_m,fullmicro_n,unroll}
     N = VectorizationBase.pick_vector_width(T)
     mregister = max(1, micro_m ÷ N)
     V = SVec{N,T}
@@ -404,14 +405,13 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         end
-
-        return nothing
     end
 
     expr = quote
         begin
             $(Expr(:meta,:inline))
             $kernel_code
+            return nothing
         end
     end
     return expr

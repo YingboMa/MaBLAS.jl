@@ -104,14 +104,3 @@ end
     display(timer)
     @test all(iszero, TimerOutputs.totmeasured(timer))
 end
-
-#=
-@testset "Kernel partition" begin
-    @test MaBLAS.decompose_to_microkernels(4, 8, 6)  == ([8, 4, 2, 1], [6, 4, 2, 1])
-    @test MaBLAS.decompose_to_microkernels(4, 8, 5)  == ([8, 4, 2, 1], [5, 3, 1])
-    @test MaBLAS.decompose_to_microkernels(4, 12, 5) == ([12, 8, 4, 2, 1], [5, 3, 1])
-    @test MaBLAS.decompose_to_microkernels(8, 24, 5) == ([24, 16, 8, 4, 2, 1], [5, 3, 1])
-    @test_throws Any MaBLAS.decompose_to_microkernels(8, 200, 50)
-    @test_throws Any MaBLAS.decompose_to_microkernels(4, 100, 50)
-end
-=#
