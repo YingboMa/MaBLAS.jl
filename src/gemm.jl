@@ -339,15 +339,17 @@ where ``{⋅̂}`` denotes the matrix with offset.
         ps < 1 && return nothing
 
         st = sizeof(T)
-        sc1 = _stride(C, 1) * st
-        sc2 = _stride(C, 2) * st
+        sc1, sc2 = _strides(C)
+        sc1, sc2 = sc1 * st, sc2 * st
         if $matA # A is not packed
-            sa1 = _stride(A, 1) * st
-            sa2 = _stride(A, 2) * st
+            sa1, sa2 = _strides(A)
+            sa1 = sa1 * st
+            sa2 = sa2 * st
         end
         if $matB # B is not packed
-            sb1 = _stride(B, 1) * st
-            sb2 = _stride(B, 2) * st
+            sb1, sb2 = _strides(B)
+            sb1 = sb1 * st
+            sb2 = sb2 * st
         end
         @nexprs $mregister m̂ -> begin
             mask_m̂ = ($usemask && m̂ == $mregister) ? mask : # nontrival mask
@@ -385,17 +387,20 @@ where ``{⋅̂}`` denotes the matrix with offset.
         end
 
         _α = $V(α)
+        @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
+            C_m̂_n̂ = _α * AB_m̂_n̂
+        end
+
         if iszero(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
-                C_m̂_n̂ = _α * AB_m̂_n̂
-                vstore!(ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2, C_m̂_n̂, mask_m̂)
+                addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
+                vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         else
             _β = $V(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
-                C_m̂_n̂ = _β * vload($V, addr, mask_m̂)
-                C_m̂_n̂ = muladd(_α, AB_m̂_n̂, C_m̂_n̂)
+                C_m̂_n̂ = muladd(_β, vload($V, addr, mask_m̂), C_m̂_n̂)
                 vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         end
