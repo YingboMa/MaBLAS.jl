@@ -70,18 +70,22 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
     end
     # packing strategy
     packa, packb = packing
-    if packa # manual union split
-        if packb
-            _mul!(C, A, B, α, β, (Val(true),Val(true)), cache_params, kernel_params)
+    if packa isa Bool && packb isa Bool
+        if packa # manual union split
+            if packb
+                _mul!(C, A, B, α, β, (Val(true),Val(true)), cache_params, kernel_params)
+            else
+                _mul!(C, A, B, α, β, (Val(true),Val(false)), cache_params, kernel_params)
+            end
         else
-            _mul!(C, A, B, α, β, (Val(true),Val(false)), cache_params, kernel_params)
+            if packb
+                _mul!(C, A, B, α, β, (Val(false),Val(true)), cache_params, kernel_params)
+            else
+                _mul!(C, A, B, α, β, (Val(false),Val(false)), cache_params, kernel_params)
+            end
         end
     else
-        if packb
-            _mul!(C, A, B, α, β, (Val(false),Val(true)), cache_params, kernel_params)
-        else
-            _mul!(C, A, B, α, β, (Val(false),Val(false)), cache_params, kernel_params)
-        end
+        _mul!(C, A, B, α, β, packing, cache_params, kernel_params)
     end
     return C
 end
@@ -150,7 +154,7 @@ end
             Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
             Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
             Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
-            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, nothing) # no mask
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, Val(4), nothing) # no mask
             ii += m′
         end
         m = cachei₂ - ii + 1
@@ -161,7 +165,7 @@ end
         @nexprs $mregister midx -> begin
             m′ = $micro_m - (midx - 1) * $N
             if m > m′ - $N
-                microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, mask) # mask
+                microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, Val(1), mask) # mask
             end
         end
         jj += n′
@@ -275,14 +279,60 @@ where ``{⋅̂}`` denotes the matrix with offset.
 """
 @generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
                                  Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}, ::Tuple{Val{fullmicro_m},Val{fullmicro_n}},
-                                 mask) where {T,micro_m,micro_n,fullmicro_m,fullmicro_n}
+                                 ::Val{unroll}, mask) where {T,micro_m,micro_n,fullmicro_m,fullmicro_n,unroll}
     N = VectorizationBase.pick_vector_width(T)
     mregister = max(1, micro_m ÷ N)
     V = SVec{N,T}
-    unroll = 4
+    dounroll = unroll > 1
     matA = ndims(A) == 2
     matB = ndims(B) == 2
     usemask = mask != Nothing
+
+
+    nounroll_loopexpr = quote
+        prefetcht0(ptrÂ + 64 * $fullmicro_m + 2 * $fullmicro_n)
+        @nexprs $mregister m̂ -> begin
+            # assumption: A has unit leading stride
+            A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st, mask_m̂)
+        end
+        @nexprs $micro_n n̂ -> begin
+            if $matB
+                B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * sb2))
+            else
+                B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
+            end
+            @nexprs $mregister m̂ -> begin
+                AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
+            end
+        end
+        ptrÂ += $matA ? sa2 : $fullmicro_m * st
+        ptrB̂ += $matB ? sb1 : $fullmicro_n * st
+    end
+
+    unroll_loopexpr = quote
+        @nexprs $unroll u -> begin
+            #TODO
+            if !$matA
+                u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $fullmicro_n)
+                u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $fullmicro_n)
+            end
+            ## unroll variable: u
+            @nexprs $mregister m̂ -> begin
+                # assumption: A has unit leading stride, sa1 == 1
+                ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $fullmicro_m * st)
+                A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st, mask_m̂)
+            end
+            @nexprs $micro_n n̂ -> begin
+                ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $fullmicro_n * st)
+                B_n̂ = $V(unsafe_load(ptrB′))
+                @nexprs $mregister m̂ -> begin
+                    AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
+                end
+            end
+        end
+        ptrÂ += $matA ? $unroll * sa2 : $unroll * $fullmicro_m * st
+        ptrB̂ += $matB ? $unroll * sb1 : $unroll * $fullmicro_n * st
+    end
 
     kernel_code = quote
         # tell the compiler that the iteration is nonempty
@@ -309,66 +359,29 @@ where ``{⋅̂}`` denotes the matrix with offset.
         ptrB̂ = _pointer(B) + Boffset * st
 
         # prefetch C matrix
-        #=
         @nexprs $micro_n n̂ -> begin
             prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
         end
-        =#
 
         # intializing AB registers
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
-        #=
-        punroll, pleft = divrem(ps, $unroll)
-
-        # tell the compiler that the iteration is nonempty
-        (punroll < 1 && pleft < 1) && return nothing
 
         # rank-1 updates
-        for _ in 1:punroll
-            @nexprs $unroll u -> begin
-                #TODO
-                if !$matA
-                    u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $fullmicro_n)
-                    u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $fullmicro_n)
-                end
-                ## unroll variable: u
-                @nexprs $mregister m̂ -> begin
-                    # assumption: A has unit leading stride, sa1 == 1
-                    ptrA′ = ptrÂ + (u - 1) * ($matA ? sa2 : $fullmicro_m * st)
-                    A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st, mask_m̂)
-                end
-                @nexprs $micro_n n̂ -> begin
-                    ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $fullmicro_n * st)
-                    B_n̂ = $V(unsafe_load(ptrB′))
-                    @nexprs $mregister m̂ -> begin
-                        AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
-                    end
-                end
+        if $dounroll
+            punroll, pleft = divrem(ps, $unroll)
+            # tell the compiler that the iteration is nonempty
+            (punroll < 1 && pleft < 1) && return nothing
+            for _ in 1:punroll
+                $unroll_loopexpr
             end
-            ptrÂ += $matA ? $unroll * sa2 : $unroll * $fullmicro_m * st
-            ptrB̂ += $matB ? $unroll * sb1 : $unroll * $fullmicro_n * st
-        end
 
-        for _ in 1:pleft
-        =#
-        for _ in 1:ps
-            prefetcht0(ptrÂ + 64 * $fullmicro_m + 2 * $fullmicro_n)
-            @nexprs $mregister m̂ -> begin
-                # assumption: A has unit leading stride
-                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st, mask_m̂)
+            for _ in 1:pleft
+                $nounroll_loopexpr
             end
-            @nexprs $micro_n n̂ -> begin
-                if $matB
-                    B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * sb2))
-                else
-                    B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
-                end
-                @nexprs $mregister m̂ -> begin
-                    AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
-                end
+        else
+            for _ in 1:ps
+                $nounroll_loopexpr
             end
-            ptrÂ += $matA ? sa2 : $fullmicro_m * st
-            ptrB̂ += $matB ? sb1 : $fullmicro_n * st
         end
 
         _α = $V(α)
@@ -391,7 +404,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
     end
 
     expr = quote
-        @inbounds begin
+        begin
             $(Expr(:meta,:inline))
             $kernel_code
         end
