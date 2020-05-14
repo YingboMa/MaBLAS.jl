@@ -102,7 +102,7 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
     end
     m, k, n = checkmulsize(C, A, B)
     if !packa && !packb
-        macrokernel!(C, nothing, A, A, B, B, α, β, packing, (1, m), (1, k), (1, n), kernel_params)
+        macrokernel!(C, A, A, B, B, α, β, packing, (1, m), (1, k), (1, n), kernel_params)
         return C
     end
 
@@ -111,16 +111,14 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
     # get buffer
     Abuffersize = cache_m * cache_k
     Bbuffersize = cache_k * cache_n
-    ABbuffersize = micro_m * micro_n
     T = eltype(C)
     buffer = N_THREADS_BUFFERS[Threads.threadid()]
-    resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
+    resize!(buffer, (Abuffersize + Bbuffersize) * sizeof(T) + 2PAGE_SIZE)
     ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
     Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
     ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
     Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
     ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
-    ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
@@ -129,7 +127,7 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
-                macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β′, packing, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params)
+                macrokernel!(C, A, Abuffer, B, Bbuffer, α, β′, packing, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), kernel_params)
             end # cachei
         end # cachep
     end # cachej
@@ -140,15 +138,15 @@ end
 ### Macro kernel
 ###
 
-@generated function macrokernel!(C, ABbuffer, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, cacheis, cacheps, cachejs, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+@generated function macrokernel!(C, A, Abuffer, B, Bbuffer, α, β, packing::Tuple{Val{packa},Val{packb}}, cacheis, cacheps, cachejs, kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
     N = VectorizationBase.pick_vector_width(eltype(C))
     micro_m % N == 0 || error("`micro_m` must be an integer multiple of vector register width for efficient microkernel generation, got width = $N, micro_m = $micro_m.")
     mregister = max(1, micro_m ÷ N)
 
     mloopexpr = quote
         ii = cachei₁
-        m′ = micro_m
-        while (m = cachei₂ - ii + 1) >= micro_m
+        m′ = $micro_m
+        while (m = cachei₂ - ii + 1) >= $micro_m
             Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
             Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
             Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
@@ -161,7 +159,7 @@ end
         Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
         Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
         @nexprs $mregister midx -> begin
-            m′ = micro_m - (midx - 1) * $N
+            m′ = $micro_m - (midx - 1) * $N
             if m > m′ - $N
                 microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, mask) # mask
             end
@@ -183,7 +181,7 @@ end
         Boffset = packb ? 0 : (cachep₁ - 1) * bs1
 
         @nexprs $micro_n nidx -> begin
-            n′ = micro_n - nidx + 1
+            n′ = $micro_n - nidx + 1
             if nidx == 1 # hot loop
                 while (n = cachej₂ - jj + 1) >= n′
                     $mloopexpr
@@ -311,10 +309,11 @@ where ``{⋅̂}`` denotes the matrix with offset.
         ptrB̂ = _pointer(B) + Boffset * st
 
         # prefetch C matrix
-        # TODO
+        #=
         @nexprs $micro_n n̂ -> begin
             prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
         end
+        =#
 
         # intializing AB registers
         @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
@@ -398,55 +397,6 @@ where ``{⋅̂}`` denotes the matrix with offset.
         end
     end
     return expr
-end
-#TODO: (A'B), AB', and A'B'
-
-###
-### Clean up loops
-###
-
-# (mleft × nleft) = (mleft × ks) * (ks × nleft)
-# Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
-    if iszero(β)
-        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
-            end
-            C[î, ĵ] = α * ABîĵ
-        end
-    else
-        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
-            end
-            Cîĵ = C[î, ĵ]
-            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
-        end
-    end
-    return nothing
-end
-
-# copy the `AB` buffer to `C` with `β` scaling
-# Ĉ = AB[1:mleft, 1:nleft]
-function cleanup_packing!(C, ABbuffer, β, (ii, jj), mleft, nleft)
-    if iszero(β)
-        @avx for j in 1:nleft
-            for i in 1:mleft
-                C[ii + i, jj + j] = ABbuffer[i, j]
-            end
-        end
-    else
-        @avx for j in 1:nleft
-            for i in 1:mleft
-                Cij = C[ii + i, jj + j]
-                C[ii + i, jj + j] = muladd(β, Cij, ABbuffer[i, j])
-            end
-        end
-    end
-    return nothing
 end
 
 ###
