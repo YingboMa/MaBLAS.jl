@@ -368,7 +368,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
 
     kernel_code = quote
         # tell the compiler that the iteration is nonempty
-        ps < 1 && return nothing
+        SIMDPirates.assume(ps > 0)
 
         st = sizeof($T)
         cs1 = 1 * st # ctx.cs1 * st
@@ -402,7 +402,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
         if $dounroll
             punroll, pleft = divrem(ps, $unroll)
             # tell the compiler that the iteration is nonempty
-            (punroll < 1 && pleft < 1) && return nothing
+            SIMDPirates.assume(punroll > 0 || pleft > 0)
             for _ in 1:punroll
                 $unroll_loopexpr
             end
