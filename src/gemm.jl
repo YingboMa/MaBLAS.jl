@@ -100,16 +100,27 @@ partition_k(k, cache_k) = cld(k, cld(k, cache_k))
 ###
 
 # use lowercase here because these are not actually types
-struct GemmContext{packa,packb,micro_m,micro_n}
+struct GemmContext{packa,packb,micro_m,micro_n,C1,C2,A1,A2,B1,B2}
     cache_m::Int
     cache_k::Int
     cache_n::Int
-    cs1::Int
-    cs2::Int
-    as1::Int
-    as2::Int
-    bs1::Int
-    bs2::Int
+    cs1::C1
+    cs2::C2
+    as1::A1
+    as2::A2
+    bs1::B1
+    bs2::B2
+end
+function GemmContext{packa,packb,micro_m,micro_n}(cache_m, cache_k, cache_n, cs1, cs2, as1, as2, bs1, bs2) where {packa,packb,micro_m,micro_n}
+    return GemmContext{packa,packb,micro_m,micro_n,
+                       typeof(cs1),typeof(cs2),
+                       typeof(as1),typeof(as2),
+                       typeof(bs1),typeof(bs2)}(
+                                                cache_m, cache_k, cache_n,
+                                                cs1, cs2,
+                                                as1, as2,
+                                                bs1, bs2
+                                               )
 end
 
 function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
@@ -359,10 +370,10 @@ where ``{⋅̂}`` denotes the matrix with offset.
         ps < 1 && return nothing
 
         st = sizeof($T)
-        cs1 = ctx.cs1 * st
+        cs1 = 1 * st # ctx.cs1 * st
         cs2 = ctx.cs2 * st
         if $matA # A is not packed
-            as1 = ctx.as1 * st
+            as1 = 1 * st # ctx.as1 * st
             as2 = ctx.as2 * st
         end
         if $matB # B is not packed
@@ -374,9 +385,9 @@ where ``{⋅̂}`` denotes the matrix with offset.
                                                      VectorizationBase.max_mask($T) # trival mask that should be optimized away
         end
 
-        ptrĈ = _pointer(C) + Coffset * st
-        ptrÂ = _pointer(A) + Aoffset * st
-        ptrB̂ = _pointer(B) + Boffset * st
+        ptrĈ = pointer(C) + Coffset * st
+        ptrÂ = pointer(A) + Aoffset * st
+        ptrB̂ = pointer(B) + Boffset * st
 
         # prefetch C matrix
         @nexprs $micro_n n̂ -> begin
@@ -435,6 +446,29 @@ where ``{⋅̂}`` denotes the matrix with offset.
 end
 
 ###
+### Fast stride handling
+###
+
+struct One
+end
+@inline Base.:*(::One, x::Int) = x
+@inline Base.:*(x::Int, ::One) = x
+@inline Base.:+(::One, x::Int) = x + 1
+@inline Base.:+(x::Int, ::One) = x + 1
+@inline Base.:(==)(x::Int, ::One) = isone(x)
+@inline Base.:(==)(::One, x::Int) = isone(x)
+@inline _strides(A) = strides(A)
+@inline _strides(A::DenseArray) = (One(), stride(A, 2))
+@inline _strides(A::SubArray{<:Any,2,<:DenseArray,<:Tuple{Union{Base.Slice, AbstractUnitRange}, Vararg{Any}}}) = (One(), stride(A, 2))
+@inline _strides(A::Union{Adjoint,Transpose}) = reverse(_strides(parent(A)))
+@inline function _strides(A::PermutedDimsArray{T,N,perm}) where {T,N,perm}
+    s = _strides(parent(A))
+    return ntuple(d->s[perm[d]], Val(N))
+end
+@inline canonicalize(A) = A
+@inline canonicalize(A::Union{Adjoint,Transpose,PermutedDimsArray}) = canonicalize(parent(A))
+
+###
 ### Utilities
 ###
 
@@ -445,17 +479,6 @@ function checkmulsize(C, A, B)
     (cm == am && ak == bk && cn == bn) || throw(DimensionMismatch("C has dimensions ($cm, $cn), A has dimensions ($am, $ak), but B has dimensions ($bk, $bn)"))
     return cm, ak, bn
 end
-
-@inline _stride(A, n) = stride(A, n)
-@inline _pointer(A) = pointer(A)
-@inline _strides(A) = strides(A)
-@inline _strides(A::Union{Adjoint,Transpose}) = reverse(strides(parent(A)))
-#Not very safe, but okay
-@inline _stride(A::Union{Adjoint,Transpose}, n) = n == 1 ? stride(parent(A), 2) : stride(parent(A), 1)
-@inline _pointer(A::Union{Adjoint,Transpose}) = pointer(parent(A))
-
-canonicalize(A) = A
-canonicalize(A::Union{Adjoint,Transpose}) = canonicalize(parent(A))
 
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
