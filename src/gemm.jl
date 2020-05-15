@@ -134,8 +134,9 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
     ctx = GemmContext{packa,packb,micro_m,micro_n}(cache_m, cache_k, cache_n,
                                                    cs1, cs2, as1, as2, bs1, bs2)
     m, k, n = checkmulsize(C, A, B)
+    A′, B′ = canonicalize(A), canonicalize(B)
     if !packa && !packb
-        macrokernel!(C, A, B, α, β, (1, m), (1, k), (1, n), ctx)
+        macrokernel!(C, A′, B′, α, β, (1, m), (1, k), (1, n), ctx)
         return C
     end
 
@@ -148,9 +149,9 @@ function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m,
     buffer = N_THREADS_BUFFERS[Threads.threadid()]
     resize!(buffer, (Abuffersize + Bbuffersize) * sizeof(T) + 2PAGE_SIZE)
     ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
-    Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : canonicalize(A)
+    Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A′
     ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
-    Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : canonicalize(B)
+    Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B′
     ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)

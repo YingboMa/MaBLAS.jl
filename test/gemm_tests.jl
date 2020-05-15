@@ -89,12 +89,9 @@ end
     MaBLAS.enable_timer()
     MaBLAS.reset_timer!()
     for α in (1, 2, 3.0, false, true), β in (1, 2, 3.0, false, true), A in (rand(m, k), rand(k, m)'), B in (rand(k, n), rand(n, k)'), packa in (true, false), packb in (true, false)
-        try
-            AB = MaBLAS.mul!((copy(C)), A, B, α, β; packing=(packa, packb))
-            @test AB ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
-        catch
-            @test_skip AB ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β) # tiling doesn't support nonunit leading striding
-        end
+        !packa && A isa Adjoint && continue
+        AB = MaBLAS.mul!((copy(C)), A, B, α, β; packing=(packa, packb))
+        @test AB ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
     end
     tim, alloc = TimerOutputs.totmeasured(timer)
     @test tim > 0
