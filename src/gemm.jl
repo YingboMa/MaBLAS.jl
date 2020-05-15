@@ -1,8 +1,9 @@
 using SIMDPirates
 using LinearAlgebra: Transpose, Adjoint
-using Base.Cartesian: @nexprs
+using Base.Cartesian: @nexprs, @nif
 using ..LoopInfo
 using LoopVectorization: @avx
+using SIMDPirates: vfmadd231
 using VectorizationBase: VectorizationBase
 using TimerOutputs: TimerOutputs, @timeit_debug, TimerOutput
 
@@ -162,12 +163,11 @@ end
         Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
         Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
         Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
-        @nexprs $mregister midx -> begin
-            m′ = $micro_m - (midx - 1) * $N
-            if m > m′ - $N
-                microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, Val(1), mask) # mask
-            end
-        end
+        @nif $(mregister+1) midx -> begin
+            (m > (m′ = $micro_m - (midx - 1) * $N) - $N)
+        end midx -> begin
+            microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), kernel_params, Val(1), mask)
+        end midx -> nothing
         jj += n′
     end
 
@@ -201,6 +201,7 @@ end
         end
         return nothing
     end
+    # return @show macroexpand(Base, nloopexpr)
     return nloopexpr
 end
 
@@ -303,7 +304,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
             end
             @nexprs $mregister m̂ -> begin
-                AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
+                AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
             end
         end
         ptrÂ += $matA ? sa2 : $fullmicro_m * st
@@ -327,7 +328,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
                 ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? sb2 : st) + (u - 1) * ($matB ? sb1 : $fullmicro_n * st)
                 B_n̂ = $V(unsafe_load(ptrB′))
                 @nexprs $mregister m̂ -> begin
-                    AB_m̂_n̂ = muladd(A_m̂, B_n̂, AB_m̂_n̂)
+                    AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
         end
@@ -401,7 +402,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
             _β = $V(β)
             @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
                 addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
-                C_m̂_n̂ = muladd(_β, vload($V, addr, mask_m̂), C_m̂_n̂)
+                C_m̂_n̂ = vfmadd231(_β, vload($V, addr, mask_m̂), C_m̂_n̂)
                 vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         end
@@ -409,7 +410,7 @@ where ``{⋅̂}`` denotes the matrix with offset.
 
     expr = quote
         begin
-            $(Expr(:meta,:inline))
+            $(Expr(:meta, usemask ? :noinline : :inline))
             $kernel_code
             return nothing
         end
