@@ -1,10 +1,12 @@
-using SIMD
+using SIMDPirates
 using LinearAlgebra: Transpose, Adjoint
-using Base.Cartesian: @nexprs
+using Base.Cartesian: @nexprs, @nif
 using ..LoopInfo
 using LoopVectorization: @avx
+using SIMDPirates: vfmadd231
 using VectorizationBase: VectorizationBase
 using TimerOutputs: TimerOutputs, @timeit_debug, TimerOutput
+using UnPack: @unpack
 
 # General direction: we want to avoid pointer arithmetic as much as possible,
 # also, don't strict type the container type
@@ -25,8 +27,6 @@ reset_timer!() = TimerOutputs.reset_timer!(BLAS_TIMER)
 get_timer() = BLAS_TIMER
 enable_timer() = TimerOutputs.enable_debug_timings(@__MODULE__)
 disable_timer() = TimerOutputs.disable_debug_timings(@__MODULE__)
-
-const FA{T,N} = SIMD.FastContiguousArray{T,N}
 
 # alias scopes from https://github.com/JuliaLang/julia/pull/31018
 struct Const{T<:Array}
@@ -52,8 +52,10 @@ end
 ### User-level API
 ###
 
-function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=(false, false))
+function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256, cache_n=4080), kernel_params=(Val(8), Val(6)), packing=nothing)
     m, k, n = checkmulsize(C, A, B)
+    α = convert(eltype(C), α)
+    β = convert(eltype(C), β)
     iszeroα = iszero(α)
     if iszero(β) && iszeroα
         return fill!(C, zero(eltype(C)))
@@ -68,20 +70,25 @@ function mul!(C, A, B, α=true, β=false; cache_params=(cache_m=72, cache_k=256,
         end
         return C
     end
-    # packing strategy
+    # TODO: packing strategy
+    packing === nothing && (packing = (false, false))
     packa, packb = packing
-    if packa # manual union split
-        if packb
-            _mul!(C, A, B, α, β, (Val(true),Val(true)), cache_params, kernel_params)
+    if packa isa Bool && packb isa Bool
+        if packa # manual union split
+            if packb
+                _mul!(C, A, B, α, β, (Val(true),Val(true)), cache_params, kernel_params)
+            else
+                _mul!(C, A, B, α, β, (Val(true),Val(false)), cache_params, kernel_params)
+            end
         else
-            _mul!(C, A, B, α, β, (Val(true),Val(false)), cache_params, kernel_params)
+            if packb
+                _mul!(C, A, B, α, β, (Val(false),Val(true)), cache_params, kernel_params)
+            else
+                _mul!(C, A, B, α, β, (Val(false),Val(false)), cache_params, kernel_params)
+            end
         end
     else
-        if packb
-            _mul!(C, A, B, α, β, (Val(false),Val(true)), cache_params, kernel_params)
-        else
-            _mul!(C, A, B, α, β, (Val(false),Val(false)), cache_params, kernel_params)
-        end
+        _mul!(C, A, B, α, β, packing, cache_params, kernel_params)
     end
     return C
 end
@@ -92,74 +99,138 @@ partition_k(k, cache_k) = cld(k, cld(k, cache_k))
 ### Lower-level `_mul!`
 ###
 
-function _mul!(C, A, B, α, β, ::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
-    cs1 = _stride(C, 1)
-    as1 = _stride(A, 1)
-    bs1 = _stride(B, 1)
+# use lowercase here because these are not actually types
+struct GemmContext{packa,packb,micro_m,micro_n,C1,C2,A1,A2,B1,B2}
+    cache_m::Int
+    cache_k::Int
+    cache_n::Int
+    cs1::C1
+    cs2::C2
+    as1::A1
+    as2::A2
+    bs1::B1
+    bs2::B2
+end
+function GemmContext{packa,packb,micro_m,micro_n}(cache_m, cache_k, cache_n, cs1, cs2, as1, as2, bs1, bs2) where {packa,packb,micro_m,micro_n}
+    return GemmContext{packa,packb,micro_m,micro_n,
+                       typeof(cs1),typeof(cs2),
+                       typeof(as1),typeof(as2),
+                       typeof(bs1),typeof(bs2)}(
+                                                cache_m, cache_k, cache_n,
+                                                cs1, cs2,
+                                                as1, as2,
+                                                bs1, bs2
+                                               )
+end
+
+function _mul!(C, A, B, α, β, packing::Tuple{Val{packa},Val{packb}}, (cache_m, cache_k, cache_n), kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {packa,packb,micro_m,micro_n}
+    cs1, cs2 = _strides(C)
+    as1, as2 = _strides(A)
+    bs1, bs2 = _strides(B)
     cs1 == 1 || throw(ArgumentError("Packing kernel doesn't support nonunit leading stride C matrix. Got stride(C, 1) = $cs1."))
     if !packa
         as1 == 1 || throw(ArgumentError("Kernel with packed A doesn't support nonunit leading stride C and A matrices. Got stride(C, 1) = $cs1, stride(A, 1) = $as1, and stride(B, 1) = $bs1."))
     end
+    ctx = GemmContext{packa,packb,micro_m,micro_n}(cache_m, cache_k, cache_n,
+                                                   cs1, cs2, as1, as2, bs1, bs2)
     m, k, n = checkmulsize(C, A, B)
+    A′, B′ = canonicalize(A), canonicalize(B)
+    if !packa && !packb
+        macrokernel!(C, A′, B′, α, β, (1, m), (1, k), (1, n), ctx)
+        return C
+    end
 
     cache_k = partition_k(k, cache_k) # More evenly divide K
-    
-    if packa || packb
-        # get buffer
-        Abuffersize = cache_m * cache_k
-        Bbuffersize = cache_k * cache_n
-        ABbuffersize = micro_m * micro_n
-        T = eltype(C)
-        buffer = N_THREADS_BUFFERS[Threads.threadid()]
-        resize!(buffer, (Abuffersize + Bbuffersize + ABbuffersize) * sizeof(T) + 3PAGE_SIZE)
-        ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
-        Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A
-        ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
-        Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B
-        ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
-        ABbuffer = unsafe_wrap(Array, ptrbuffer, (micro_m, micro_n))
-    else
-        Abuffer = A
-        Bbuffer = B
-    end
+
+    # get buffer
+    Abuffersize = cache_m * cache_k
+    Bbuffersize = cache_k * cache_n
+    T = eltype(C)
+    buffer = N_THREADS_BUFFERS[Threads.threadid()]
+    resize!(buffer, (Abuffersize + Bbuffersize) * sizeof(T) + 2PAGE_SIZE)
+    ptrbuffer = align(convert(Ptr{T}, pointer(buffer)), PAGE_SIZE)
+    Abuffer = packa ? unsafe_wrap(Array, ptrbuffer, Abuffersize) : A′
+    ptrbuffer = align(ptrbuffer + Abuffersize * sizeof(T), PAGE_SIZE)
+    Bbuffer = packb ? unsafe_wrap(Array, ptrbuffer, Bbuffersize) : B′
+    ptrbuffer = align(ptrbuffer + Bbuffersize * sizeof(T), PAGE_SIZE)
 
     for cachej₁ in 1:cache_n:n; cachej₂ = min(cachej₁ + cache_n - 1, n)
         for cachep₁ in 1:cache_k:k; cachep₂ = min(cachep₁ + cache_k - 1, k) # TODO: add adaptive packing?
-            _β = cachep₁ == 1 ? β : one(β)
-            ps = cachep₂ - cachep₁ + 1
+            β′ = cachep₁ == 1 ? β : one(β)
             packb && @timeit_debug BLAS_TIMER "Pack B" packBbuffer!(Bbuffer, B, cachep₁, cachep₂, cachej₁, cachej₂, Val(micro_n))
             for cachei₁ in 1:cache_m:m; cachei₂ = min(cachei₁ + cache_m - 1, m)
                 packa && @timeit_debug BLAS_TIMER "Pack A" packAbuffer!(Abuffer, A, cachei₁, cachei₂, cachep₁, cachep₂, Val(micro_m))
                 # macrokernel
-                for microj₁ in cachej₁:micro_n:cachej₂; nleft = min(cachej₂ - microj₁ + 1, micro_n)
-                    for microi₁ in cachei₁:micro_m:cachei₂; mleft = min(cachei₂ - microi₁ + 1, micro_m)
-                        Coffset = (microi₁ - 1) * _stride(C, 1) + (microj₁ - 1) * _stride(C, 2)
-                        Aoffset = packa ? (microi₁ - cachei₁) * ps :
-                            (microi₁ - 1) * _stride(A, 1) + (cachep₁ - 1) * _stride(A, 2)
-                        Boffset = packb ? (microj₁ - cachej₁) * ps :
-                            (cachep₁ - 1) * _stride(B, 1) + (microj₁ - 1) * _stride(B, 2)
-
-                        if nleft == micro_n && mleft == micro_m
-                            # (micro_m × ks) * (ks × micro_n)
-                            # Ĉ = A[i:(i+micro_m-1), ps] * B[ps, j:(j+micro_n-1)]
-                            microkernel!(C, Abuffer, Bbuffer, α, _β,  Coffset, Aoffset, Boffset, ps, kernel_params)
-                        else
-                            if packa && packb
-                                # microkernel writes to the `AB` buffer
-                                microkernel!(ABbuffer, Abuffer, Bbuffer, α, false, 0, Aoffset, Boffset, ps, kernel_params)
-                                # copy the `AB` buffer to `C` with `β` scaling
-                                # Ĉ = AB[1:mleft, 1:nleft]
-                                cleanup_packing!(C, ABbuffer, _β, (microi₁ - 1, microj₁ - 1), mleft, nleft)
-                            else
-                                cleanup_tiling_microkernel!(C, A, B, α, _β, microi₁, microj₁, cachep₁, cachep₂, mleft, nleft)
-                            end
-                        end
-                    end # microi
-                end # microj
+                macrokernel!(C, Abuffer, Bbuffer, α, β′, (cachei₁, cachei₂), (cachep₁, cachep₂), (cachej₁, cachej₂), ctx)
             end # cachei
         end # cachep
     end # cachej
     return C
+end
+
+###
+### Macro kernel
+###
+
+@generated function macrokernel!(C, A, B, α, β, cacheis, cacheps, cachejs, ctx::GemmContext{packa,packb,micro_m,micro_n})::Nothing where {packa,packb,micro_m,micro_n}
+    T = eltype(C)
+    N = VectorizationBase.pick_vector_width(T)
+    micro_m % N == 0 || error("`micro_m` must be an integer multiple of vector register width for efficient microkernel generation, got width = $N, micro_m = $micro_m.")
+    mregister = max(1, micro_m ÷ N)
+
+    mloopexpr = quote
+        ii = cachei₁
+        m′ = $micro_m
+        while (m = cachei₂ - ii + 1) >= $micro_m
+            Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+            Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
+            Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
+            microkernel!(C, A, B, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), Val(4), nothing, ctx) # no mask
+            ii += m′
+        end
+        m = cachei₂ - ii + 1
+        mask = VectorizationBase.mask($T, m)
+        Coffset = (ii - 1) * cs1 + (jj - 1) * cs2
+        Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
+        Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
+        @nif $(mregister+1) midx -> begin
+            m′ = $micro_m - (midx - 1) * $N
+            m > m′ - $N
+        end midx -> begin
+            microkernel!(C, A, B, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), Val(1), mask, ctx) # mask
+        end midx -> nothing
+        jj += n′
+    end
+
+    nloopexpr = quote
+        cachei₁, cachei₂ = cacheis
+        cachep₁, cachep₂ = cacheps
+        cachej₁, cachej₂ = cachejs
+        ps = cachep₂ - cachep₁ + 1
+        @unpack cs1, cs2, as1, as2, bs1, bs2 = ctx
+        jj = jjfull = cachej₁
+        micro_n_offset = 0
+        Aoffset = packa ? 0 : (cachep₁ - 1) * as2
+        Boffset = packb ? 0 : (cachep₁ - 1) * bs1
+        n′ = $micro_n
+        while (n = cachej₂ - jj + 1) >= n′
+            $mloopexpr
+            jjfull = jj
+        end # full n
+        jjfull = jj # set `jjfull` after completing a full `micro_n`
+
+        @nif $micro_n nidx -> begin
+            n′ = $micro_n - nidx
+            n = cachej₂ - jj + 1
+            n >= n′
+        end nidx -> begin
+            $mloopexpr
+            micro_n_offset += n′
+        end nidx -> nothing
+        return nothing
+    end
+    # macroexpand(@__MODULE__, nloopexpr)
+    return nloopexpr
 end
 
 ###
@@ -226,193 +297,177 @@ end
 ### Micro kernel
 ###
 
-@generated function microkernel!(C::AbstractMatrix{T}, A::AbstractVecOrMat{T}, B::AbstractVecOrMat{T}, α, β,
-                                 Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}}) where {T,micro_m,micro_n}
+"""
+    microkernel!(C, Abuffer, Bbuffer, α, β, Coffset, Aoffset, Boffset, m, ps,
+        kernel_params::Tuple{Val{micro_m},Val{micro_n}}) where {micro_m,micro_n}
+
+A kernel that computes
+```julia
+Ĉ[1:m, 1:n] = α * Â[1:m, 1:ps] * B̂[1:ps, 1:n] + β * Ĉ[1:m, 1:n]
+```
+where ``{⋅̂}`` denotes the matrix with offset.
+"""
+@generated function microkernel!(C, A, B, α, β, Coffset, Aoffset, Boffset, ps, ::Tuple{Val{micro_m},Val{micro_n}},::Val{unroll}, mask,
+                                 ctx::GemmContext{packa,packb,fullmicro_m,fullmicro_n})::Nothing where {micro_m,micro_n,unroll,packa,packb,fullmicro_m,fullmicro_n}
+    T = eltype(C)
+    TA = eltype(A)
+    TB = eltype(B)
+    T === TA === TB || throw(ArgumentError("eltype(C) === eltype(A) === eltype(B) must hold in the microkernel! Got eltype(C) = $T, eltype(A) = $TA, eltype(B) = $TB."))
     N = VectorizationBase.pick_vector_width(T)
-    V = Vec{N,T}
-    unroll = 4
-    m2 = micro_m ÷ N
-    matA = ndims(A) == 2
-    matB = ndims(B) == 2
+    mregister = max(1, micro_m ÷ N)
+    V = SVec{N,T}
+    dounroll = unroll > 1
+    matA = !packa
+    matB = !packb
+    usemask = mask != Nothing
 
-    kernel_code = quote
-        st = sizeof(T)
-        sc1 = _stride(C, 1) * st
-        sc2 = _stride(C, 2) * st
-        if $matA
-            sa1 = _stride(A, 1) * st
-            sa2 = _stride(A, 2) * st
+    nounroll_loopexpr = quote
+        prefetcht0(ptrÂ + 64 * $fullmicro_m + 2 * $fullmicro_n)
+        @nexprs $mregister m̂ -> begin
+            # assumption: A has unit leading stride
+            A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st, mask_m̂)
         end
-        if $matB
-            sb1 = _stride(B, 1) * st
-            sb2 = _stride(B, 2) * st
-        end
-
-        punroll, pleft = divrem(ps, $unroll)
-
-        ptrĈ = _pointer(C) + Coffset * st
-        ptrÂ = _pointer(A) + Aoffset * st
-        ptrB̂ = _pointer(B) + Boffset * st
-
-        # prefetch C matrix
-        # TODO
         @nexprs $micro_n n̂ -> begin
-            prefetcht0(ptrĈ + (n̂ - 1) * sc2 + 7 * 8)
-        end
-
-        # rank-1 updates
-        @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> AB_m̂_n̂ = zero($V)
-        for _ in 1:punroll
-            @nexprs $unroll u -> begin
-                #TODO
-                if !$matA
-                    u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
-                    u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $micro_n)
-                end
-                ## unroll variable: u
-                @nexprs $m2 m̂ -> begin
-                    if $matA
-                        # assumption: A has unit leading stride
-                        A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st + (u - 1) * sa2)
-                    else
-                        A_m̂ = vload($V, ptrÂ + (u - 1) * $micro_m * st + (m̂ - 1) * $N * st)
-                    end
-                end
-                @nexprs $micro_n n̂ -> begin
-                    if $matB
-                        B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2 + (u - 1) * sb1))
-                    else
-                        B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st + (u - 1) * $micro_n * st))
-                    end
-                    @nexprs $m2 m̂ -> begin
-                        AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
-                    end
-                end
+            if $matB
+                B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * bs2))
+            else
+                B_n̂ = $V(vload(ptrB̂ + (n̂ - 1) * st))
             end
-            ptrÂ += $matA ? $unroll * sa2 : $unroll * $micro_m * st
-            ptrB̂ += $matB ? $unroll * sb1 : $unroll * $micro_n * st
+            @nexprs $mregister m̂ -> begin
+                AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
+            end
         end
+        ptrÂ += $matA ? as2 : $fullmicro_m * st
+        ptrB̂ += $matB ? bs1 : $fullmicro_n * st
+    end
 
-        for _ in 1:pleft
+    unroll_loopexpr = quote
+        @nexprs $unroll u -> begin
             #TODO
-            prefetcht0(ptrÂ + 64 * $micro_m + 2 * $micro_n)
-            @nexprs $m2 m̂ -> begin
-                # assumption: A has unit leading stride
-                A_m̂ = vload($V, ptrÂ + (m̂ - 1) * $N * st)
+            if !$matA
+                u == 1 && prefetcht0(ptrÂ + 64 * $micro_m + 2 * $fullmicro_n)
+                u == 3 && prefetcht0(ptrÂ + 76 * $micro_m + 2 * $fullmicro_n)
+            end
+            ## unroll variable: u
+            @nexprs $mregister m̂ -> begin
+                # assumption: A has unit leading stride, as1 == 1
+                ptrA′ = ptrÂ + (u - 1) * ($matA ? as2 : $fullmicro_m * st)
+                A_m̂ = vload($V, ptrA′ + (m̂ - 1) * $N * st, mask_m̂)
             end
             @nexprs $micro_n n̂ -> begin
-                if $matB
-                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * sb2))
-                else
-                    B_n̂ = $V(unsafe_load(ptrB̂ + (n̂ - 1) * st))
-                end
-                @nexprs $m2 m̂ -> begin
-                    AB_m̂_n̂ = fma(A_m̂, B_n̂, AB_m̂_n̂)
+                ptrB′ = ptrB̂ + (n̂ - 1) * ($matB ? bs2 : st) + (u - 1) * ($matB ? bs1 : $fullmicro_n * st)
+                B_n̂ = $V(unsafe_load(ptrB′))
+                @nexprs $mregister m̂ -> begin
+                    AB_m̂_n̂ = vfmadd231(A_m̂, B_n̂, AB_m̂_n̂)
                 end
             end
-            ptrÂ += $matA ? sa2 : $micro_m * st
-            ptrB̂ += $matB ? sb1 : $micro_n * st
+        end
+        ptrÂ += $matA ? $unroll * as2 : $unroll * $fullmicro_m * st
+        ptrB̂ += $matB ? $unroll * bs1 : $unroll * $fullmicro_n * st
+    end
+
+    kernel_code = quote
+        # tell the compiler that the iteration is nonempty
+        SIMDPirates.assume(ps > 0)
+
+        st = sizeof($T)
+        cs1 = 1 * st # ctx.cs1 * st
+        cs2 = ctx.cs2 * st
+        if $matA # A is not packed
+            as1 = 1 * st # ctx.as1 * st
+            as2 = ctx.as2 * st
+        end
+        if $matB # B is not packed
+            bs1 = ctx.bs1 * st
+            bs2 = ctx.bs2 * st
+        end
+        @nexprs $mregister m̂ -> begin
+            mask_m̂ = ($usemask && m̂ == $mregister) ? mask : # nontrival mask
+                                                     VectorizationBase.max_mask($T) # trival mask that should be optimized away
+        end
+
+        ptrĈ = pointer(C) + Coffset * st
+        ptrÂ = pointer(A) + Aoffset * st
+        ptrB̂ = pointer(B) + Boffset * st
+
+        # prefetch C matrix
+        @nexprs $micro_n n̂ -> begin
+            prefetcht0(ptrĈ + (n̂ - 1) * cs2 + 7 * 8)
+        end
+
+        # intializing AB registers
+        @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> AB_m̂_n̂ = zero($V)
+
+        # rank-1 updates
+        if $dounroll
+            punroll, pleft = divrem(ps, $unroll)
+            # tell the compiler that the iteration is nonempty
+            SIMDPirates.assume(punroll > 0 || pleft > 0)
+            for _ in 1:punroll
+                $unroll_loopexpr
+            end
+
+            for _ in 1:pleft
+                $nounroll_loopexpr
+            end
+        else
+            for _ in 1:ps
+                $nounroll_loopexpr
+            end
         end
 
         _α = $V(α)
+        @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
+            C_m̂_n̂ = _α * AB_m̂_n̂
+        end
+
         if iszero(β)
-            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
-                C_m̂_n̂ = _α * AB_m̂_n̂
-                vstore(C_m̂_n̂, ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2)
+            @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
+                addr = ptrĈ + (m̂ - 1) * $N * cs1 + (n̂ - 1) * cs2
+                vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         else
             _β = $V(β)
-            @nexprs $micro_n n̂ -> @nexprs $m2 m̂ -> begin
-                addr = ptrĈ + (m̂ - 1) * $N * sc1 + (n̂ - 1) * sc2
-                C_m̂_n̂ = _β * vload($V, addr)
-                C_m̂_n̂ = fma(_α, AB_m̂_n̂, C_m̂_n̂)
-                vstore(C_m̂_n̂, addr)
+            @nexprs $micro_n n̂ -> @nexprs $mregister m̂ -> begin
+                addr = ptrĈ + (m̂ - 1) * $N * cs1 + (n̂ - 1) * cs2
+                C_m̂_n̂ = vfmadd231(_β, vload($V, addr, mask_m̂), C_m̂_n̂)
+                vstore!(addr, C_m̂_n̂, mask_m̂)
             end
         end
-
-        return nothing
     end
 
     expr = quote
-        @inbounds begin
-            $(Expr(:meta,:noinline))
+        begin
+            $(Expr(:meta, usemask ? :noinline : :inline))
             $kernel_code
+            return nothing
         end
     end
     return expr
 end
-#TODO: (A'B), AB', and A'B'
 
 ###
-### Clean up loops
+### Fast stride handling
 ###
 
-# (mleft × nleft) = (mleft × ks) * (ks × nleft)
-# Ĉ = A[i:(i+mleft-1), ps] * B[ps, j:(j+nleft-1)]
-function cleanup_tiling_microkernel!(C, A::FA, B::FA, α, β, i, j, p₁, p₂, mleft, nleft)
-    if iszero(β)
-        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
-            end
-            C[î, ĵ] = α * ABîĵ
-        end
-    else
-        @avx for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(A[î, p̂], B[p̂, ĵ], ABîĵ)
-            end
-            Cîĵ = C[î, ĵ]
-            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
-        end
-    end
-    return nothing
+struct One
 end
-
-# fallback: @avx miss compiles non-unit stride matrix
-function cleanup_tiling_microkernel!(C, A, B, α, β, i, j, p₁, p₂, mleft, nleft)
-    if iszero(β)
-        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
-            end
-            C[î, ĵ] = α * ABîĵ
-        end
-    else
-        @inbounds @aliasscope for ĵ in j:(j+nleft-1), î in i:(i+mleft-1)
-            ABîĵ = zero(eltype(C))
-            for p̂ in p₁:p₂
-                ABîĵ = muladd(constarray(A)[î, p̂], constarray(B)[p̂, ĵ], ABîĵ)
-            end
-            Cîĵ = C[î, ĵ]
-            C[î, ĵ] = muladd(α, ABîĵ, β * Cîĵ)
-        end
-    end
-    return nothing
+@inline Base.:*(::One, x::Int) = x
+@inline Base.:*(x::Int, ::One) = x
+@inline Base.:+(::One, x::Int) = x + 1
+@inline Base.:+(x::Int, ::One) = x + 1
+@inline Base.:(==)(x::Int, ::One) = isone(x)
+@inline Base.:(==)(::One, x::Int) = isone(x)
+@inline _strides(A) = strides(A)
+@inline _strides(A::DenseArray) = (One(), stride(A, 2))
+@inline _strides(A::SubArray{<:Any,2,<:DenseArray,<:Tuple{Union{Base.Slice, AbstractUnitRange}, Vararg{Any}}}) = (One(), stride(A, 2))
+@inline _strides(A::Union{Adjoint,Transpose}) = reverse(_strides(parent(A)))
+@inline function _strides(A::PermutedDimsArray{T,N,perm}) where {T,N,perm}
+    s = _strides(parent(A))
+    return ntuple(d->s[perm[d]], Val(N))
 end
-
-# copy the `AB` buffer to `C` with `β` scaling
-# Ĉ = AB[1:mleft, 1:nleft]
-function cleanup_packing!(C, ABbuffer, β, (ii, jj), mleft, nleft)
-    if iszero(β)
-        @avx for j in 1:nleft
-            for i in 1:mleft
-                C[ii + i, jj + j] = ABbuffer[i, j]
-            end
-        end
-    else
-        @avx for j in 1:nleft
-            for i in 1:mleft
-                Cij = C[ii + i, jj + j]
-                C[ii + i, jj + j] = muladd(β, Cij, ABbuffer[i, j])
-            end
-        end
-    end
-    return nothing
-end
+@inline canonicalize(A) = A
+@inline canonicalize(A::Union{Adjoint,Transpose,PermutedDimsArray}) = canonicalize(parent(A))
 
 ###
 ### Utilities
@@ -425,13 +480,6 @@ function checkmulsize(C, A, B)
     (cm == am && ak == bk && cn == bn) || throw(DimensionMismatch("C has dimensions ($cm, $cn), A has dimensions ($am, $ak), but B has dimensions ($bk, $bn)"))
     return cm, ak, bn
 end
-
-@inline _stride(A, n) = stride(A, n)
-@inline _pointer(A) = pointer(A)
-#@inline _stride(A::Union{Adjoint,Transpose}, n) = reverse(strides(parent(A)))[n]
-#Not very safe, but okay
-@inline _stride(A::Union{Adjoint,Transpose}, n) = n == 1 ? stride(parent(A), 2) : stride(parent(A), 1)
-@inline _pointer(A::Union{Adjoint,Transpose}) = pointer(parent(A))
 
 prefetcht0(ptr::Ptr) = __prefetch(ptr, Val(:read), Val(3), Val(:data))
 # From https://github.com/vchuravy/GPUifyLoops.jl/pull/5
