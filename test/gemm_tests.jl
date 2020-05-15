@@ -2,6 +2,7 @@ using Test
 using MaBLAS
 using LinearAlgebra
 using TimerOutputs
+using VectorizationBase: pick_vector_width
 
 noreturn_mul!(args...; kwargs...) = (MaBLAS.mul!(args...; kwargs...); nothing)
 
@@ -18,8 +19,10 @@ end
     C = rand(m, n)
     A = rand(m, k)
     B = rand(k, n)
+    T = Float64
+    N = pick_vector_width(T)
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packa in (true, false), packb in (true, false)
-        for kernel_params in [(Val(8), Val(6)), (Val(12), Val(4)), (Val(4), Val(3))]
+        for kernel_params in [(Val(N), Val(6)), (Val(N), Val(4)), (Val(2N), Val(3))]
             @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb)) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
         end
     end
@@ -40,8 +43,9 @@ end
     cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
     α, β = randn(2)
     for T in (Float64, Float32)
+        N = pick_vector_width(T)
         for packa in (true, false), packb in (true, false), (m, k, n) in [(73, 131, 257), (101, 103, 107), (109, 113, 127), (131, 137, 139), (149, 151, 157), (163, 167, 173), (179, 181, 191), (193, 197, 199)] # all primes
-            for kernel_params in [(Val(8), Val(6)), (Val(12), Val(4)), (Val(4), Val(3))]
+            for kernel_params in [(Val(N), Val(6)), (Val(N), Val(4)), (Val(2N), Val(3))]
                 C = rand(T, m, n)
                 A = rand(T, m, k)
                 B = rand(T, k, n)
