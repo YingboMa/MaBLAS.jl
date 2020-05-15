@@ -12,18 +12,19 @@ noreturn_mul!(args...; kwargs...) = (MaBLAS.mul!(args...; kwargs...); nothing)
 end
 
 @testset "Kernel sized matmul" begin
-    _m, _k, _n = 8*3, 8, 6*5
+    _m, _k, _n = 8*4*4, 8, 6*4*4*3
     # lower cache_params to check multiple of cache sizes more easily
-    cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
+    cache_params = (_m, _k, _n)
     m, k, n = _m*2, _k*3, _n*5
     C = rand(m, n)
     A = rand(m, k)
     B = rand(k, n)
     T = Float64
     N = pick_vector_width(T)
+    cache_params = cache_params .* 4N
     for α in (1, 2, 3, false, true), β in (1, 2, 3, false, true), packa in (true, false), packb in (true, false)
         for kernel_params in [(Val(N), Val(6)), (Val(N), Val(4)), (Val(2N), Val(3))]
-            @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb)) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+            @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb), kernel_params=kernel_params) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
         end
     end
     packa, packb = true, false
@@ -38,9 +39,9 @@ end
 end
 
 @testset "Clean up loop tests" begin
-    _m, _k, _n = 8*3, 8, 6*5
+    _m, _k, _n = 8*4*4, 8*2, 6*4*3
     # lower cache_params to check clean up loops more easily
-    cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
+    cache_params = (_m, _k, _n)
     α, β = randn(2)
     for T in (Float64, Float32)
         N = pick_vector_width(T)
@@ -49,9 +50,9 @@ end
                 C = rand(T, m, n)
                 A = rand(T, m, k)
                 B = rand(T, k, n)
-                @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb)) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
-                @allocated noreturn_mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb))
-                @allocated(noreturn_mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb))) <= (packa + packb) * 176 # minor allocation when packing
+                @test MaBLAS.mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb), kernel_params=kernel_params) ≈ LinearAlgebra.mul!((copy(C)), A, B, α, β)
+                @allocated noreturn_mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb), kernel_params=kernel_params)
+                @allocated(noreturn_mul!((copy(C)), A, B, α, β; cache_params=cache_params, packing=(packa, packb), kernel_params=kernel_params)) <= (packa + packb) * 176 # minor allocation when packing
             end
         end
     end
@@ -62,7 +63,7 @@ end
     A = @view V[1:100,  1:100]
     B = @view V[101:end, 1:100]
     C = @view V[1:100, 101:end]
-    _m, _k, _n = 8*3, 8, 6*5
+    _m, _k, _n = 8*4*4, 8*2, 6*4*3
     cache_params = (cache_m=_m, cache_k=_k, cache_n=_n)
     @test LinearAlgebra.mul!((copy(C)), A, B) ≈ MaBLAS.mul!(C, A, B; cache_params=cache_params)
     for packa in (true, false), packb in (true, false)
