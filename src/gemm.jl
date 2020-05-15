@@ -194,7 +194,8 @@ end
         Aoffset′ = Aoffset + (packa ? (ii - cachei₁) * ps : (ii - 1) * as1)
         Boffset′ = Boffset + (packb ? (jjfull - cachej₁) * ps + micro_n_offset : (jj - 1) * bs2)
         @nif $(mregister+1) midx -> begin
-            (m > (m′ = $micro_m - (midx - 1) * $N) - $N)
+            m′ = $micro_m - (midx - 1) * $N
+            m > m′ - $N
         end midx -> begin
             microkernel!(C, A, B, α, β, Coffset, Aoffset′, Boffset′, ps, (Val(m′), Val(n′)), Val(1), mask, ctx) # mask
         end midx -> nothing
@@ -211,25 +212,24 @@ end
         micro_n_offset = 0
         Aoffset = packa ? 0 : (cachep₁ - 1) * as2
         Boffset = packb ? 0 : (cachep₁ - 1) * bs1
+        n′ = $micro_n
+        while (n = cachej₂ - jj + 1) >= n′
+            $mloopexpr
+            jjfull = jj
+        end # full n
+        jjfull = jj # set `jjfull` after completing a full `micro_n`
 
-        @nexprs $micro_n nidx -> begin
-            n′ = $micro_n - nidx + 1
-            if nidx == 1 # hot loop
-                while (n = cachej₂ - jj + 1) >= n′
-                    $mloopexpr
-                    jjfull = jj
-                end # full n
-                jjfull = jj # set `jjfull` after completing a full `micro_n`
-            else # cleanup loop
-                if (n = cachej₂ - jj + 1) >= n′
-                    $mloopexpr
-                    micro_n_offset += n′
-                end
-            end
-        end
+        @nif $micro_n nidx -> begin
+            n′ = $micro_n - nidx
+            n = cachej₂ - jj + 1
+            n >= n′
+        end nidx -> begin
+            $mloopexpr
+            micro_n_offset += n′
+        end nidx -> nothing
         return nothing
     end
-    # return @show macroexpand(Base, nloopexpr)
+    # macroexpand(@__MODULE__, nloopexpr)
     return nloopexpr
 end
 
